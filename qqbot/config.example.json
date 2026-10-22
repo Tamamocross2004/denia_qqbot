@@ -56,6 +56,11 @@
     "time": "08:30",
     "group": 0
   },
+  "voice": {
+    "enable": true,
+    "name": "zh-CN-XiaoyiNeural",
+    "max_chars": 60
+  },
   "rate_limit_seconds": 2,
   "reply_chunk": 800,
   "host": "0.0.0.0",

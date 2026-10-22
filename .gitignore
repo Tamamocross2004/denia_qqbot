@@ -31,6 +31,8 @@ qqbot/_bak/
 qqbot/inbox/
 *.tmp
 *.log
+_msg.txt
+_*.txt
 
 # ---------- 本地工作区元数据 ----------
 # .workbuddy 里有开发笔记，含真实 QQ 号和群号

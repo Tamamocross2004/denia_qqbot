@@ -920,6 +920,77 @@ AI 圈
 
 第 2 步容易忘。忘了的后果是：指令会留在 `GROUP_RECENT` 里，重启后灌回背景，模型看到就容易被带偏——之前「@她 日报」被存进缓冲，导致后来问她一个陌生名字，她编了一段日报来应付。
 
+## 语音
+
+`@她 说 困死了` → 她用 `edge-tts` 合成一段语音发出来。
+
+### 链路
+
+```
+文字 → edge-tts → MP3（内存里的 bytes）
+     → record 段 base64:// → NapCat
+     → addon 检测不是 SILK → 转码 → 发给 QQ
+```
+
+### 关键发现：不用装 ffmpeg
+
+原本以为要自己把 MP3 转成 SILK，实测**不用**。
+
+NapCat 的 `native/ffmpeg/ffmpegAddon.win32.x64.node` 里带着完整 FFmpeg（6.8MB）和 SILK 编码器：
+
+```
+AVConvertToNTSilkTctWorker
+SILK_V3
+NTSilk
+```
+
+收到非 SILK 的音频时，它自己会跑：
+
+```js
+语音文件${t}需要转换成silk
+await Ni.convertToNTSilkTct(t, i)   // -c:a ntsilk_s16le -ar 24000 -ac 1
+```
+
+所以 Python 侧只要产出标准 MP3 就行，格式的事交给协议端。
+
+顺带排除了另一条路：Python 直接编码 SILK。`pysilk` 在 PyPI 上是个空包（只有 dist-info，没有模块）；`pilk` 要编译 C 源码，本机 MSVC 编译不过。都不如让 NapCat 干活。
+
+### 配置
+
+```json
+"voice": {
+  "enable": true,
+  "name": "zh-CN-XiaoyiNeural",
+  "max_chars": 60
+}
+```
+
+`max_chars` 是硬截断——QQ 语音有 60 秒上限，60 个中文字大约 15 秒，留了余量。
+
+换声音改 `name`：
+
+| 声音 | 感觉 |
+|---|---|
+| `zh-CN-XiaoyiNeural` | 年轻女声，偏活泼（默认） |
+| `zh-CN-XiaoxiaoNeural` | 温柔知性，更稳 |
+| `zh-CN-XiaomoNeural` | 偏低沉，适合慵懒人设 |
+
+### 体积
+
+3 秒语音约 26KB MP3，base64 后 35KB 的 WS 报文。60 字的极限情况大概 140KB，离 websockets 默认 1MB 上限还远。
+
+### ⚠️ 最后一步没验证
+
+`edge-tts` 出 MP3 ✓、addon 有 SILK 编码器 ✓、报文构造 ✓——但**QQ 客户端到底能不能播，只有真发一次才知道**。
+
+如果发出去是「语音加载失败」或者干脆不显示，可能的原因：
+
+1. NapCat 的 addon 加载失败（`[FFmpegAddonAdapter] Failed to load addon`）
+2. QQ 要求语音带额外元数据（时长、MD5），而 `record` 段没给全
+3. 服务端风控拦截了非真人录音
+
+排查看 `napcat/logs/*.log` 里有没有 `语音文件已就绪` 和 `时长` 这两行。
+
 ## 联网搜索
 
 用 **DeepSeek 自带的 Search API**，不需要接第三方：

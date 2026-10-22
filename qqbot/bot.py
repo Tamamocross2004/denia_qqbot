@@ -896,9 +896,10 @@ def _is_cmd_text(t: str) -> bool:
     s = re.sub(r"@\d+", "", t or "").strip()
     if s in CMD_WORDS:
         return True
-    # 「查 某人」要带分隔，不然「查到问题了」会被当成查人
+    # 「查 某人」「说 一句话」要带分隔，不然「查到问题了」会被当成查人
     parts = s.replace("：", " ").split(maxsplit=1)
-    return len(parts) == 2 and parts[0] in ("查", "查一下", "你记得")
+    return len(parts) == 2 and parts[0] in (
+        "查", "查一下", "你记得", "说", "语音", "念")
 RECENT_INJECT = 15     # 每次注入多少条给模型
 GLOSSARY_PATH = BASE / "glossary.json"
 LORE_PATH = BASE / "lore.json"
@@ -1531,6 +1532,7 @@ COMMANDS = [
     ("日报", "昨天的 AI 和科技新闻"),
     ("总结", "把刚才群里的聊天捋一遍"),
     ("查 某人", "我记得的关于他"),
+    ("说 一句话", "用语音念出来"),
     ("帮助", "就是这张表"),
 ]
 
@@ -1608,6 +1610,54 @@ async def who_is(name: str, gid: int) -> str:
     else:
         lines.append("· 还没记住什么具体的事")
     return "\n".join(lines)
+
+
+# ---------- 语音 ----------
+
+async def tts(text: str) -> bytes | None:
+    """文字转 MP3。NapCat 收到后会用自己的 ffmpeg addon 转成 SILK，
+    所以这里不用管格式——native/ffmpeg 里带了 SILK 编码器。"""
+    c = cfg().get("voice") or {}
+    if not c.get("enable", True):
+        return None
+    text = (text or "").strip()[: int(c.get("max_chars", 60))]
+    if not text:
+        return None
+    try:
+        import edge_tts
+    except ImportError:
+        log.warning("没装 edge-tts，语音功能不可用")
+        return None
+    voice = str(c.get("name") or "zh-CN-XiaoyiNeural")
+    buf = bytearray()
+    try:
+        comm = edge_tts.Communicate(text, voice)
+        async for chunk in comm.stream():
+            if chunk.get("type") == "audio" and chunk.get("data"):
+                buf += chunk["data"]
+    except Exception as exc:
+        log.warning("TTS 失败：%s", exc)
+        return None
+    return bytes(buf) if buf else None
+
+
+async def send_voice(ws, evt: dict, text: str) -> bool:
+    audio = await tts(text)
+    if not audio:
+        return False
+    seg = [{"type": "record", "data": {
+        "file": "base64://" + base64.b64encode(audio).decode()}}]
+    if evt.get("message_type") == "group":
+        action, params = "send_group_msg", {"group_id": evt["group_id"], "message": seg}
+    else:
+        action, params = "send_private_msg", {"user_id": evt["user_id"], "message": seg}
+    try:
+        await ws.send(json.dumps({"action": action, "params": params, "echo": "voice"}))
+        log.info("语音已发送，%d 字节 mp3", len(audio))
+        return True
+    except Exception as exc:
+        log.warning("发语音失败：%s", exc)
+        return False
 
 
 # ---------- 事件处理 ----------
@@ -1704,6 +1754,10 @@ async def handle(ws, evt: dict) -> None:
     cp = text.strip().replace("：", " ").split(maxsplit=1)
     if len(cp) == 2 and cp[0] in ("查", "查一下", "你记得"):
         await reply(ws, evt, await who_is(cp[1].strip(), evt.get("group_id") or 0))
+        return
+    if len(cp) == 2 and cp[0] in ("说", "语音", "念"):
+        if not await send_voice(ws, evt, cp[1].strip()):
+            await reply(ws, evt, "……嗓子哑了，念不出来。")
         return
     if text.strip() in ("日报", "/日报", "早报", "/早报"):
         await reply(ws, evt, "……等着，我翻一下，别催。")
