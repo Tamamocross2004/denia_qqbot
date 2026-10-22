@@ -1614,19 +1614,58 @@ async def who_is(name: str, gid: int) -> str:
 
 # ---------- 语音 ----------
 
-async def tts(text: str) -> bytes | None:
-    """文字转 MP3。NapCat 收到后会用自己的 ffmpeg addon 转成 SILK，
-    所以这里不用管格式——native/ffmpeg 里带了 SILK 编码器。"""
-    c = cfg().get("voice") or {}
-    if not c.get("enable", True):
+async def tts_local(text: str, c: dict) -> bytes | None:
+    """调本地 GPT-SoVITS 服务（达妮娅本人的音色）。
+
+    服务是同步阻塞的 HTTP，单句大约要十几秒，所以扔到线程里跑，
+    别堵住 asyncio 事件循环——否则这段时间整群消息都处理不了。
+    """
+    url = str(c.get("local_url") or "http://127.0.0.1:9880/tts")
+    # 参考音频支持相对路径（相对 qqbot/），这样换机器不用改绝对路径
+    ref = str(c.get("ref_audio") or "")
+    if ref and not os.path.isabs(ref):
+        ref = str((BASE / ref).resolve())
+    payload = {
+        "text": text,
+        # all_zh 而不是 zh：zh 会走多语言分段，纯中文也可能落到 en 分支，
+        # 那样会去拉 g2p_en，多一层不确定因素。
+        "text_lang": "all_zh",
+        "ref_audio_path": ref,
+        "prompt_lang": "all_zh",
+        "prompt_text": str(c.get("ref_text") or ""),
+        "text_split_method": "cut5",
+        "media_type": "wav",
+        "streaming_mode": False,
+        "speed_factor": float(c.get("speed", 1.0)),
+    }
+    if not payload["ref_audio_path"]:
+        log.warning("voice.ref_audio 没配，跳过本地 TTS")
         return None
-    text = (text or "").strip()[: int(c.get("max_chars", 60))]
-    if not text:
+    body = json.dumps(payload).encode("utf-8")
+    timeout = float(c.get("timeout", 120))
+
+    def _post() -> bytes:
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        # 显式禁代理：urllib 默认读系统代理，会把 127.0.0.1 的请求塞进 Clash
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as r:
+            return r.read()
+
+    try:
+        audio = await asyncio.to_thread(_post)
+    except Exception as exc:
+        log.warning("本地 TTS 失败（回退 edge-tts）：%s: %s",
+                    type(exc).__name__, str(exc)[:120])
         return None
+    return audio or None
+
+
+async def tts_edge(text: str, c: dict) -> bytes | None:
     try:
         import edge_tts
     except ImportError:
-        log.warning("没装 edge-tts，语音功能不可用")
+        log.warning("没装 edge-tts，兜底语音不可用")
         return None
     voice = str(c.get("name") or "zh-CN-XiaoyiNeural")
     buf = bytearray()
@@ -1636,9 +1675,29 @@ async def tts(text: str) -> bytes | None:
             if chunk.get("type") == "audio" and chunk.get("data"):
                 buf += chunk["data"]
     except Exception as exc:
-        log.warning("TTS 失败：%s", exc)
+        log.warning("edge-tts 失败：%s", exc)
         return None
     return bytes(buf) if buf else None
+
+
+async def tts(text: str) -> bytes | None:
+    """文字转音频。NapCat 收到后会用自己的 ffmpeg addon 转成 SILK，
+    所以这里只管给出标准音频流——native/ffmpeg 里带了 SILK 编码器。"""
+    c = cfg().get("voice") or {}
+    if not c.get("enable", True):
+        return None
+    text = (text or "").strip()[: int(c.get("max_chars", 60))]
+    if not text:
+        return None
+
+    engine = str(c.get("engine") or "auto")
+    if engine in ("auto", "local"):
+        audio = await tts_local(text, c)
+        if audio:
+            return audio
+        if engine == "local":
+            return None
+    return await tts_edge(text, c)
 
 
 async def send_voice(ws, evt: dict, text: str) -> bool:
@@ -1653,7 +1712,7 @@ async def send_voice(ws, evt: dict, text: str) -> bool:
         action, params = "send_private_msg", {"user_id": evt["user_id"], "message": seg}
     try:
         await ws.send(json.dumps({"action": action, "params": params, "echo": "voice"}))
-        log.info("语音已发送，%d 字节 mp3", len(audio))
+        log.info("语音已发送，%d 字节（格式交给 NapCat 转 SILK）", len(audio))
         return True
     except Exception as exc:
         log.warning("发语音失败：%s", exc)

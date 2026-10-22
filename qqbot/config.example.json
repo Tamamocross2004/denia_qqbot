@@ -58,6 +58,12 @@
   },
   "voice": {
     "enable": true,
+    "engine": "auto",
+    "local_url": "http://127.0.0.1:9880/tts",
+    "ref_audio": "../tts/ref/ref_010.wav",
+    "ref_text": "每天都能睡个好觉，吃到美味的东西，还有就是……和朋友们在一起。",
+    "speed": 1.0,
+    "timeout": 120,
     "name": "zh-CN-XiaoyiNeural",
     "max_chars": 60
   },

@@ -922,21 +922,91 @@ AI 圈
 
 ## 语音
 
-`@她 说 困死了` → 她用 `edge-tts` 合成一段语音发出来。
+`@她 说 困死了` → 她用**达妮娅本人的音色**说一遍。本地跑 GPT-SoVITS，不联网、不花钱。
 
 ### 链路
 
 ```
-文字 → edge-tts → MP3（内存里的 bytes）
+文字 → bot → POST http://127.0.0.1:9880/tts（本地 GPT-SoVITS）
+     → 32kHz wav（内存里的 bytes，不落盘）
      → record 段 base64:// → NapCat
-     → addon 检测不是 SILK → 转码 → 发给 QQ
+     → addon 转 SILK → QQ
 ```
 
-### 关键发现：不用装 ffmpeg
+本地服务没起时**自动回退 edge-tts**，这时声音是微软的、不是她，但至少不会变哑巴。想彻底只在本地成功时才发，把 `voice.engine` 设成 `"local"`。
 
-原本以为要自己把 MP3 转成 SILK，实测**不用**。
+### 启动
 
-NapCat 的 `native/ffmpeg/ffmpegAddon.win32.x64.node` 里带着完整 FFmpeg（6.8MB）和 SILK 编码器：
+双击 `start-voice.bat`，然后才是 `start-all.bat`。脚本干三件事：
+
+- `cd` 到 `tts/GPT-SoVITS`
+- 设 `FFMPEG_BIN` 指向 `tts/bin/ffmpeg.exe`
+- 起 `api_v2.py`，监听 `127.0.0.1:9880`
+
+模型加载约 60 秒，显存占 **1.7GB**（8GB 的 4070 很宽松）。这个窗口必须一直开着，关了语音就退化成 edge-tts。
+
+### 音频素材：不用自己录
+
+HuggingFace 上有个公开 bucket `huanx/daniya-gptsovits-trainer-storage`，里面是完整的训练工程：
+
+| 内容 | 说明 |
+|---|---|
+| 数据集 | 85 段 wav，48kHz 单声道，**9.56 分钟** |
+| 标注 | `metadata.csv`：`file,text,language,speaker` |
+| SoVITS 权重 | `logs_s2_v2/G_164.pth`，训了 164 epoch |
+| hps 配置 | `logs/daniya/config.json` |
+| 缺失 | GPT 权重（`logs_s1_v2` 里只有 TensorBoard 日志） |
+
+**录屏、分离人声、切片、标注全免。** 授权是「仅限二创、不得商用、不得二次配布」。
+
+下载走 `hf-mirror.com`，bucket 的路径**没有 `/main/`**：
+
+```
+https://hf-mirror.com/buckets/huanx/daniya-gptsovits-trainer-storage/resolve/daniya_trainer/dataset/metadata.csv
+```
+
+### 权重格式要转一次
+
+`G_164.pth` 是训练中间产物，只有 `model / iteration / optimizer / learning_rate`；推理要的是 `{"weight", "config", "info"}`。直接扔进去会报 `KeyError: 'config'`。
+
+用训练时的 `logs/daniya/config.json` 当 hps 拼一下就行，产出 `SoVITS_weights_v2/daniya_e164.pth`（推理配置里指向这个）。
+
+### 音色验证
+
+`tts/batch_test.py` 生成三条不同情绪的句子，用 `librosa.pyin` 提基频做对比：
+
+```
+参考音频  9.7s  F0 中位 295 Hz  P10-P90 229-375
+生成 01   7.9s  F0 中位 296 Hz
+生成 02   8.3s  F0 中位 273 Hz
+生成 03   9.4s  F0 中位 291 Hz
+偏差 9 Hz —— 音高分布基本重合
+```
+
+基频只是可量化的那部分，最终还是要人耳判断语气像不像。用 GPT 权重是官方的，所以**音色像、韵律偏平**；想让语气也有她那种有气无力的感觉，得用这 9.5 分钟数据补训 GPT（8G 显存约 30 分钟）。
+
+### 环境搭建踩的坑
+
+这套依赖是 2024 年的，直接按 requirements 装会连环失败。按顺序记录：
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| **Python 版本** | `numba==0.56.4` 要 `llvmlite` 只支持 <3.11 | 用 **Python 3.10**，不能 3.11+ |
+| **torch wheel** | cp310 和 cp311 是不同 wheel | 换版本后 2.4GB 要重下，选版本前先看 numba |
+| **源码编译** | `jieba` / `distance` 只有 sdist，构建触发沙箱拦 `reg.exe` | 下 sdist 解压，纯 Python 直接放进 site-packages，再补 `dist-info` 让 pip 认 |
+| **jieba_fast** | C 扩展，镜像上 404 | 写兼容层转发给 `jieba`（API 一致，慢一点不影响音质） |
+| **transformers** | 没约束版本 → 装了 5.x → 提示 `PyTorch >= 2.6 is required`，直接禁用 torch | 钉 `transformers==4.44.2` |
+| **LangSegment** | 0.2.0 的 `__init__.py` 导出 `setLangfilters`，但模块里只有 `setfilters`，包自身不一致 | 改 `__init__.py` 的导出列表 |
+| **g2pw 模型** | 官方 paddlespeech 链接 404 | 从 `iqt-voice/G2PWModel` 下 7 个文件到 `GPT_SoVITS/text/G2PWModel/` |
+| **gradio** | `tools/my_utils.py` 顶层 `import gradio`，但 `load_audio` 根本不用它 | 改成函数内惰性导入（否则为了个 UI 库还得装 gradio，还会把 numpy 拽到 2.x） |
+| **ffmpeg** | 系统没有，`load_audio` 报 `WinError 2` | 装 `imageio-ffmpeg`，把自带的 exe 复制到 `tts/bin/`，用 `FFMPEG_BIN` 显式指定 |
+| **ffmpeg 路径** | Git Bash 导出的 PATH 是 POSIX 格式，Windows 子进程不认 | 不能靠 PATH，必须传绝对路径 |
+
+另外砍掉了 `funasr` / `Faster_Whisper` / `modelscope` / 韩粤语包——推理路径用不到，`oss2` 的编译还会卡住。
+
+### 为什么不用自己转 SILK
+
+NapCat 的 `native/ffmpeg/ffmpegAddon.win32.x64.node`（6.8MB）里带着完整 FFmpeg 和 SILK 编码器：
 
 ```
 AVConvertToNTSilkTctWorker
@@ -944,52 +1014,48 @@ SILK_V3
 NTSilk
 ```
 
-收到非 SILK 的音频时，它自己会跑：
+收到非 SILK 音频时它自己跑：
 
 ```js
 语音文件${t}需要转换成silk
 await Ni.convertToNTSilkTct(t, i)   // -c:a ntsilk_s16le -ar 24000 -ac 1
 ```
 
-所以 Python 侧只要产出标准 MP3 就行，格式的事交给协议端。
-
-顺带排除了另一条路：Python 直接编码 SILK。`pysilk` 在 PyPI 上是个空包（只有 dist-info，没有模块）；`pilk` 要编译 C 源码，本机 MSVC 编译不过。都不如让 NapCat 干活。
+所以 Python 侧只要给出标准音频流。另一条路（Python 直接编 SILK）也试过：`pysilk` 在 PyPI 上是空包，`pilk` 要编译 C 源码、本机过不了。都不如让 NapCat 干活。
 
 ### 配置
 
 ```json
 "voice": {
   "enable": true,
+  "engine": "auto",
+  "local_url": "http://127.0.0.1:9880/tts",
+  "ref_audio": "../tts/ref/ref_010.wav",
+  "ref_text": "每天都能睡个好觉，吃到美味的东西，还有就是……和朋友们在一起。",
+  "speed": 1.0,
+  "timeout": 120,
   "name": "zh-CN-XiaoyiNeural",
   "max_chars": 60
 }
 ```
 
-`max_chars` 是硬截断——QQ 语音有 60 秒上限，60 个中文字大约 15 秒，留了余量。
+- `engine`：`auto` = 先本地、失败回退 edge-tts；`local` = 只用本地；`edge` = 只用微软
+- `ref_audio` / `ref_text`：参考音频和它**逐字对应**的文本，GPT-SoVITS 靠这个定音色。换一句就得两个一起换
+- `ref_audio` 支持相对路径（相对 `qqbot/`），换机器不用改绝对路径
+- `speed` 大于 1 更快
+- `max_chars` 硬截断：QQ 语音 60 秒上限，60 个中文字约 15 秒
 
-换声音改 `name`：
+`ref_text` 必须和音频内容一字不差，多一个标点都会让音色发飘。当前用的 `010.wav` 是「每天都能睡个好觉，吃到美味的东西，还有就是……和朋友们在一起。」——语气本身是慵懒的，正好合人设。
 
-| 声音 | 感觉 |
-|---|---|
-| `zh-CN-XiaoyiNeural` | 年轻女声，偏活泼（默认） |
-| `zh-CN-XiaoxiaoNeural` | 温柔知性，更稳 |
-| `zh-CN-XiaomoNeural` | 偏低沉，适合慵懒人设 |
+### 耗时
 
-### 体积
+单句约 10~20 秒（8 秒音频），首句有预热会更久。所以 `tts_local` 跑在 `asyncio.to_thread` 里，不阻塞事件循环——否则这段时间整群消息都处理不了。
 
-3 秒语音约 26KB MP3，base64 后 35KB 的 WS 报文。60 字的极限情况大概 140KB，离 websockets 默认 1MB 上限还远。
+### ⚠️ QQ 端未验证
 
-### ⚠️ 最后一步没验证
+`200 OK` ✓、wav 8.04 秒 32kHz ✓、`record` 段正常发出 ✓、NapCat 转码链路已知 ✓——但**QQ 客户端能不能播，只有真发一次才知道**。
 
-`edge-tts` 出 MP3 ✓、addon 有 SILK 编码器 ✓、报文构造 ✓——但**QQ 客户端到底能不能播，只有真发一次才知道**。
-
-如果发出去是「语音加载失败」或者干脆不显示，可能的原因：
-
-1. NapCat 的 addon 加载失败（`[FFmpegAddonAdapter] Failed to load addon`）
-2. QQ 要求语音带额外元数据（时长、MD5），而 `record` 段没给全
-3. 服务端风控拦截了非真人录音
-
-排查看 `napcat/logs/*.log` 里有没有 `语音文件已就绪` 和 `时长` 这两行。
+发出去如果是「语音加载失败」或者干脆不显示，看 `napcat/logs/*.log` 里有没有 `语音文件已就绪` 和 `时长` 两行：有「时长」说明转码成功、问题在 QQ 端（可能是风控拦非真人录音）；没有说明卡在转码。
 
 ## 联网搜索
 
