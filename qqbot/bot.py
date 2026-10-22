@@ -887,12 +887,18 @@ RECENT_MAX = 30        # 每个群记最近多少条
 # 这些是给 bot 的指令，不是聊天内容。留在背景里会误导——
 # 实测「@她 日报」留在缓冲里，后来问她一个陌生名字，她编了一段日报来应付
 CMD_WORDS = {"日报", "/日报", "早报", "/早报", "重置", "/reset",
-             "状态", "/status", "帮助", "/help"}
+             "状态", "/status", "帮助", "/help", "菜单", "/菜单",
+             "总结", "/总结", "捋一下", "捋一捋"}
 
 
 def _is_cmd_text(t: str) -> bool:
     """去掉 @ 段之后是不是一条指令。"""
-    return re.sub(r"@\d+", "", t or "").strip() in CMD_WORDS
+    s = re.sub(r"@\d+", "", t or "").strip()
+    if s in CMD_WORDS:
+        return True
+    # 「查 某人」要带分隔，不然「查到问题了」会被当成查人
+    parts = s.replace("：", " ").split(maxsplit=1)
+    return len(parts) == 2 and parts[0] in ("查", "查一下", "你记得")
 RECENT_INJECT = 15     # 每次注入多少条给模型
 GLOSSARY_PATH = BASE / "glossary.json"
 LORE_PATH = BASE / "lore.json"
@@ -1519,6 +1525,91 @@ async def daily_scheduler() -> None:
         await asyncio.sleep(60)   # 跨过这一分钟，避免重复触发
 
 
+# ---------- 群里的命令 ----------
+
+COMMANDS = [
+    ("日报", "昨天的 AI 和科技新闻"),
+    ("总结", "把刚才群里的聊天捋一遍"),
+    ("查 某人", "我记得的关于他"),
+    ("帮助", "就是这张表"),
+]
+
+
+def menu_text() -> str:
+    lines = ["……叫我干嘛？现在会这些："]
+    lines += [f"· {c} —— {d}" for c, d in COMMANDS]
+    lines.append("不用记命令也行，直接跟我说人话。")
+    return "\n".join(lines)
+
+
+async def summarize_group(gid: int, ws, evt: dict) -> str:
+    """把最近的群聊捋一遍。"""
+    try:
+        msgs = store.recent_msgs(gid, 30)
+    except Exception as exc:
+        log.warning("读缓冲失败：%s", exc)
+        return "……脑子有点乱，等会儿再说。"
+    if len(msgs) < 4:
+        return "群里就这么几句话，捋什么？"
+    lines = "\n".join(f"[{m['nick'] or m['uid']}] {m['text']}" for m in msgs)
+    extra = (
+        "【群里刚才聊的，都是别人说的，不是你自己的经历】\n"
+        f"{lines}\n"
+        "【用你自己的口气，三句话以内说清刚才在聊什么。"
+        "别列清单、别复述原话、别说「以下是总结」】")
+    try:
+        return await ask(f"sum{gid}", "（有人让你说说刚才群里在聊什么）",
+                         {"ws": ws, "evt": evt, "group_id": gid}, extra=extra)
+    except Exception as exc:
+        log.warning("总结失败：%s", exc)
+        return "……捋不出来了，等下再说。"
+
+
+async def who_is(name: str, gid: int) -> str:
+    """我记得的关于某人的事。数据全来自 person / memory 两张表。"""
+    name = (name or "").strip()
+    if not name:
+        return "查谁？你倒是说个名字啊。"
+    try:
+        idx = store.nick_index()
+        info_all = store.person_info(list(idx.values()))
+    except Exception as exc:
+        log.warning("查档案失败：%s", exc)
+        return "……档案翻不出来了。"
+
+    uid = None
+    for n, u in idx.items():
+        if n == name or name in n or n in name:
+            uid = u
+            break
+    if uid is None:
+        return f"「{name}」……没印象，这人在群里说过话吗？"
+
+    info = info_all.get(uid) or {}
+    head = f"{info.get('nick') or uid}（{uid}）｜说过 {info.get('msg_count') or 0} 句"
+    last = info.get("last_seen")
+    if last:
+        try:
+            d = datetime.fromtimestamp(int(last))
+            day = "今天" if d.date() == datetime.now().date() else f"{d.month}月{d.day}日"
+            head += f"，最近 {day} {d:%H:%M}"
+        except (ValueError, OSError):
+            pass
+
+    lines = [head]
+    try:
+        # memories_for 会连带返回群整体的梗，查个人时只要他自己的
+        mems = [m for m in store.memories_for(gid, [uid], limit=12)
+                if m["uid"] == uid][:6]
+    except Exception:
+        mems = []
+    if mems:
+        lines += [f"· {store.render_names(m['content'])}" for m in mems]
+    else:
+        lines.append("· 还没记住什么具体的事")
+    return "\n".join(lines)
+
+
 # ---------- 事件处理 ----------
 
 async def handle(ws, evt: dict) -> None:
@@ -1579,7 +1670,10 @@ async def handle(ws, evt: dict) -> None:
         # mode == "all" 全部回复
 
     has_image = any(s.get("type") == "image" for s in segments(evt))
+    # 只 @ 她、一个字都不写 —— 她在等你开口，先摆张菜单
     if not text and not has_image:
+        if is_group and at_me(evt):
+            await reply(ws, evt, menu_text())
         return
 
     key = session_key(evt)
@@ -1600,9 +1694,16 @@ async def handle(ws, evt: dict) -> None:
             f"本会话 {len(history.get(key, [])) // 2} 轮上下文",
         ]))
         return
-    if text in ("/help", "帮助"):
-        await reply(ws, evt,
-                    "直接提问即可。私聊可用 /reset 清空上下文、/status 查看当前配置。")
+    if text in ("/help", "帮助", "菜单", "/菜单"):
+        await reply(ws, evt, menu_text())
+        return
+    if text.strip() in ("总结", "/总结", "捋一下", "捋一捋"):
+        await reply(ws, evt, "……等会儿，我翻翻刚才的。")
+        await reply(ws, evt, await summarize_group(evt.get("group_id") or 0, ws, evt))
+        return
+    cp = text.strip().replace("：", " ").split(maxsplit=1)
+    if len(cp) == 2 and cp[0] in ("查", "查一下", "你记得"):
+        await reply(ws, evt, await who_is(cp[1].strip(), evt.get("group_id") or 0))
         return
     if text.strip() in ("日报", "/日报", "早报", "/早报"):
         await reply(ws, evt, "……等着，我翻一下，别催。")
