@@ -1,0 +1,37 @@
+# ---------- 密钥 ----------
+qqbot/.env
+*.key
+*.pem
+
+# ---------- 运行时数据 ----------
+# memory.db 里有群友的聊天记录和提取出的记忆，不进仓库
+qqbot/memory.db
+qqbot/memory.db-journal
+qqbot/memory.db-wal
+qqbot/logs/
+
+# ---------- 本地配置 ----------
+# config.json 里有真实的群号和 QQ 号，仓库里放 config.example.json
+qqbot/config.json
+
+# ---------- 依赖与缓存 ----------
+qqbot/.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---------- 第三方与二进制 ----------
+# napcat 是 112M 的第三方协议端，按 README 自己下载
+napcat/
+bin/
+
+# ---------- 备份与临时 ----------
+qqbot/_bak/
+qqbot/inbox/
+*.tmp
+*.log
+
+# ---------- 本地工作区元数据 ----------
+# .workbuddy 里有开发笔记，含真实 QQ 号和群号
+.workbuddy/
