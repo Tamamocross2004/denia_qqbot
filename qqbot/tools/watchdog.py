@@ -35,6 +35,21 @@ PAUSE_PATH = LOG_DIR / "watchdog.pause"
 NAPCAT_DIR = ROOT / "napcat"
 LOCK_PORT = 45671                                       # 只做单例互斥，不跑业务
 
+# NapCat 自己的控制台输出（扫码、验证码、登录失败原因都在这上面）。
+# 看门狗从 DEVNULL 改成写文件，就是为了下次出事能直接看到原因。
+CONSOLE_LOG = LOG_DIR / "napcat-console.log"
+MARKER = LOG_DIR / "NEEDS_LOGIN.txt"
+QR_PNG = NAPCAT_DIR / "cache" / "qrcode.png"
+WEBUI_CFG = NAPCAT_DIR / "config" / "webui.json"
+
+# 控制台里出现这些字样 = QQ 卡在人工验证上，重启多少次都没用，必须停手
+HUMAN_MARKS = ("需要验证码", "二维码已保存到", "自动密码回退登录需要验证码")
+# 出现这些 = 登录成功/在线，可以清掉 needs_human
+OK_MARKS = ("AdapterManager", "登录成功", "自动快速登录成功", "自动密码回退登录成功")
+
+# 重启后最多盯多久（秒）：够 NapCat 走完 快速登录 -> 密码登录 -> 二维码
+LOGIN_WAIT = 150
+
 DEFAULTS = {
     "enable": True,
     "check_every": 60,      # 巡检间隔（秒）
@@ -130,11 +145,79 @@ def read_heartbeat() -> dict | None:
 
 # ---------- 重启 ----------
 
-def restart_napcat(boot_pid: int, dry: bool) -> None:
+def webui_url() -> str:
+    """WebUI 登录页（带 token），人工验证码就在这个页面完成。"""
+    try:
+        d = json.loads(WEBUI_CFG.read_text(encoding="utf-8"))
+        return f"http://127.0.0.1:{d.get('port', 6099)}/webui?token={d.get('token', '')}"
+    except Exception:
+        return "http://127.0.0.1:6099/webui"
+
+
+def console_tail(n: int = 8000) -> str:
+    try:
+        with open(CONSOLE_LOG, "r", encoding="utf-8", errors="ignore") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - n))
+            return f.read()
+    except Exception:
+        return ""
+
+
+def notify_human(reason: str) -> None:
+    """QQ 卡在验证码/扫码上：写说明文件 + 把二维码弹出来，然后别再重启。"""
+    msg = (
+        "达妮娅掉线了，而且需要人工登录一次（QQ 要求验证码或扫码），看门狗已停止重启。\n"
+        f"原因：{reason}\n"
+        f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        "怎么修（二选一）：\n"
+        f"1) 打开 WebUI 登录页，按页面提示收短信验证码/扫码：\n   {webui_url()}\n"
+        "2) 扫二维码图片（NapCat 刚生成的那张）：\n"
+        f"   {QR_PNG}\n\n"
+        "登录成功后本文件会自动删除，看门狗恢复待命。\n"
+    )
+    try:
+        MARKER.write_text(msg, encoding="utf-8")
+    except Exception:
+        pass
+    log.error("需要人工登录：%s", reason)
+    # 二维码弹出来，用户扫一下就完事
+    try:
+        if QR_PNG.exists():
+            big = QR_PNG.with_name("qrcode_big.png")
+            subprocess.run([sys.executable, str(BASE / "tools" / "qr_big.py")],
+                           capture_output=True, timeout=60,
+                           creationflags=CREATE_NO_WINDOW)
+            target = big if big.exists() else QR_PNG
+            subprocess.Popen(["cmd", "/c", "start", "", str(target)],
+                             creationflags=CREATE_NO_WINDOW)
+            log.warning("已把二维码图片弹出来：%s", target)
+    except Exception as exc:
+        log.warning("弹二维码失败：%s", exc)
+
+
+def _wait_login(seconds: int = 150) -> str:
+    """启动后盯控制台，判断是登进去了、还是卡在人工验证。"""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(4)
+        hb = read_heartbeat()
+        if hb and hb.get("online"):
+            return "ok"
+        tail = console_tail()
+        if any(m in tail for m in HUMAN_MARKS):
+            return "need_human"
+        if any(m in tail for m in OK_MARKS):
+            return "ok"
+    return "unknown"
+
+
+def restart_napcat(boot_pid: int, dry: bool) -> str:
     log.warning("准备重启 NapCat（boot pid=%s）", boot_pid or "无")
     if dry:
         log.warning("[dry-run] 只演示，实际没杀也没拉")
-        return
+        return "dry"
 
     st = _load_state()
     st["restarts"] = (st.get("restarts") or []) + [time.time()]
@@ -148,18 +231,49 @@ def restart_napcat(boot_pid: int, dry: bool) -> None:
                            capture_output=True, text=True,
                            creationflags=CREATE_NO_WINDOW,
                            encoding="utf-8", errors="ignore")
-        log.warning("taskkill 返回 %s %s", r.returncode, (r.stdout or r.stderr or "").strip())
+        log.warning("taskkill 返回 %s", r.returncode)
     for _ in range(20):
         time.sleep(1)
         if not napcat_boot_pid():
             break
 
+    # 控制台输出落文件：扫码、验证码、登录失败的唯一线索都在这
+    try:
+        CONSOLE_LOG.parent.mkdir(exist_ok=True)
+        if CONSOLE_LOG.exists() and CONSOLE_LOG.stat().st_size > 4 * 1024 * 1024:
+            CONSOLE_LOG.unlink()
+    except Exception:
+        pass
+    out = open(CONSOLE_LOG, "a", encoding="utf-8", errors="replace")
+    out.write(f"\n\n===== watchdog restart {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    out.flush()
     subprocess.Popen(
         ["cmd", "/c", "run.bat"], cwd=str(NAPCAT_DIR),
         creationflags=subprocess.CREATE_NEW_CONSOLE,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
     )
-    log.warning("已拉起 napcat\\run.bat，等它自己登录")
+    log.warning("已拉起 napcat\\run.bat，等它登录（输出见 logs/%s）", CONSOLE_LOG.name)
+
+    result = _wait_login(LOGIN_WAIT)
+    if result == "need_human":
+        notify_human("QQ 要求验证码/扫码，自动登录走不通")
+        st = _load_state()
+        st["needs_human"] = True
+        st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
+        _save_state(st)
+    elif result == "ok":
+        st = _load_state()
+        st["needs_human"] = False
+        st["fail_streak"] = 0
+        _save_state(st)
+        log.warning("NapCat 已重新登录")
+    else:
+        st = _load_state()
+        st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
+        _save_state(st)
+        log.warning("等了 %s 秒没看到登录成功的迹象，下次再试（连续失败 %s 次）",
+                    LOGIN_WAIT, st["fail_streak"])
+    return result
 
 
 # ---------- 单次巡检 ----------
@@ -181,10 +295,22 @@ def check(dry: bool = False) -> str:
         return f"心跳已 {int(age)} 秒没更新（超过 stale={c.get('stale')}），整套停了，跳过"
 
     st = _load_state()
-    restarts = [t for t in (st.get("restarts") or []) if now - t < 3600]
-    if restarts and now - max(restarts) < float(c.get("cooldown", DEFAULTS["cooldown"])):
-        return f"距上次重启 {int(now - max(restarts))} 秒，冷却期内不动"
 
+    # 已经判定要人工登录：只等，不再重启（重启会把待扫的二维码/验证码冲掉）
+    if st.get("needs_human"):
+        if hb.get("online"):
+            st["needs_human"] = False
+            st["fail_streak"] = 0
+            _save_state(st)
+            try:
+                MARKER.unlink()
+            except Exception:
+                pass
+            log.warning("已恢复在线，清除 needs_human")
+            return "已恢复在线"
+        return f"等人工登录（{MARKER} 里有步骤，WebUI：{webui_url()}）"
+
+    restarts = [t for t in (st.get("restarts") or []) if now - t < 3600]
     if hb.get("online"):
         return f"在线（心跳 {int(age)} 秒前）"
 
@@ -193,11 +319,18 @@ def check(dry: bool = False) -> str:
     if offline_for < limit:
         return f"离线 {int(offline_for)} 秒（阈值 {int(limit)}），再等等"
 
+    # 连续失败就翻倍退避：10min -> 20min -> 40min -> 上限 1h
+    streak = int(st.get("fail_streak") or 0)
+    wait = float(c.get("cooldown", DEFAULTS["cooldown"])) * (2 ** min(streak, 6))
+    wait = min(wait, 3600)
+    if restarts and now - max(restarts) < wait:
+        return f"距上次重启 {int(now - max(restarts))} 秒（退避 {int(wait)} 秒），再等等"
+
     if len(restarts) >= int(c.get("max_per_hour", DEFAULTS["max_per_hour"])):
         return f"最近一小时已重启 {len(restarts)} 次，达到上限，先不动"
 
-    restart_napcat(napcat_boot_pid(), dry)
-    return f"离线 {int(offline_for)} 秒 -> 已触发重启"
+    result = restart_napcat(napcat_boot_pid(), dry)
+    return f"离线 {int(offline_for)} 秒 -> 已触发重启（结果：{result}）"
 
 
 def main() -> int:

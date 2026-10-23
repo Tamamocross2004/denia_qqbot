@@ -126,7 +126,7 @@ cd D:/code/deepseek/qqbot
 
 于是补两层保险：
 
-**① 自动回退登录（治根）**
+**① 自动回退登录**
 
 被踢下线时本地 token 一起失效，只配 `NAPCAT_QUICK_ACCOUNT` 的场合，`requestQuickLogin()` 失败后没有下一步，只能落到二维码。给它一个密码：
 
@@ -134,17 +134,45 @@ cd D:/code/deepseek/qqbot
 qqbot\.venv\Scripts\python.exe qqbot\tools\set_napcat_password.py
 ```
 
-密码用 `getpass` 输入（不回显），只把 MD5 写进 `napcat/run.bat` 的 `NAPCAT_QUICK_PASSWORD_MD5`，明文不落盘。之后 Worker 重启会自己走密码回退登录，不需要扫码也不需要开 WebUI。
+密码用 `getpass` 输入（不回显），只把 MD5 写进 `napcat/run.bat` 的 `NAPCAT_QUICK_PASSWORD_MD5`，明文不落盘。之后 Worker 重启会自己走密码回退登录。
 
 > 前提是 bot 号**单独设过 QQ 密码**。一路只靠扫码/手机登录过的号没有密码，得先去 QQ 安全中心设一个。
+
+**⚠️ 但密码不等于全自动。** 10-23 的实际控制台输出是这样的：
+
+```
+正在快速登录  3951224783
+[WebUi] 自动快速登录失败: 登录态已失效，请重新登录。
+正在密码登录  3951224783
+请扫描下面的二维码，然后在手Q上授权登录：
+二维码已保存到 D:\code\deepseek\napcat\cache\qrcode.png
+需要验证码, proofWaterUrl: https://ti.qq.com/safe/tools/captcha/sms-verify-login?...
+[WebUi] 自动密码回退登录需要验证码，请在登录页面继续完成: 3951224783
+```
+
+**QQ 的登录风控会要短信验证码。** 这一步机器没法自己过——所以"被踢之后自动恢复"在风控触发时是不可能做到的，谁也别指望。能做的只有两件事：让被踢变少，以及卡住时别瞎折腾。
 
 **② 看门狗（保底）**
 
 `tools/watchdog.py` 只读一个信号：`bot.py` 每 20 秒写一次的 `qqbot/logs/heartbeat.json`。
 
 - 断开持续超过 `offline_after` 秒 → 重启 NapCat
+- 重启后盯 `logs/napcat-console.log` 最多 `LOGIN_WAIT`（150）秒：
+  - 看到 `需要验证码` / `二维码已保存到` → **判定需要人工**，写 `logs/NEEDS_LOGIN.txt`（含 WebUI 登录页地址），把 `cache/qrcode.png` 放大后弹到屏幕上，然后**停止重启**
+  - 看到登录成功的迹象 / 心跳转在线 → 清状态，继续待命
+  - 都没看到 → `fail_streak+1`，退避时间翻倍（10min → 20 → 40 → 上限 1h）
 - 心跳超过 `stale` 秒没更新 → 认为整套都被你关了，不动（免得你自己停了她又被拉起来）
 - `qqbot/logs/watchdog.pause` 这个文件存在 → 暂停，手动维护时用
+
+> **为什么必须"卡住就停手"**：10-23 那天看门狗每 10 分钟重启一次、连着重启了 16 次，每次都撞在验证码上，而且**每次重启都会把上一张待人扫的二维码冲掉**——人想扫都来不及。所以现在一旦确认要人工，就一直等到心跳转在线，期间不再动。
+
+排查现场只看三个文件：
+
+| 文件 | 内容 |
+|---|---|
+| `qqbot/logs/watchdog.log` | 每次巡检的决策、重启、退避、需要人工的判定 |
+| `qqbot/logs/napcat-console.log` | NapCat 的完整控制台输出（快速登录/密码登录/验证码/二维码链接都在这） |
+| `qqbot/logs/NEEDS_LOGIN.txt` | 只在需要人工登录时出现，写着怎么修；登进去后自动删除 |
 - 两次重启之间强制冷却 `cooldown` 秒，一小时最多 `max_per_hour` 次，防止来回拉扯
 
 重启范围严格限制：只 `taskkill /PID <NapCatWinBootMain.exe> /T /F`，官方 QQ 是从 `explorer.exe` 起的另一棵树，**不会被牵连**（这条是实测确认的，别改成按进程名杀）。
