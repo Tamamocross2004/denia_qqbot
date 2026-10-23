@@ -246,6 +246,19 @@ FORCE_SEARCH_HINT = (
     "查不到就直说「查了，网上也没有」，不要装作知道。"
 )
 
+# 实测 23:36 那次：「Tibo……我查一下，别急。」说完就没了下文，工具一次没调。
+# 空头支票比直接说不知道更糟——用户以为马上有答案，结果永远等不到。
+PROMISE_RE = re.compile(
+    r"(查一下|查查|查下|搜一下|搜搜|搜下|翻一下|翻翻|等我查|等我搜"
+    r"|我去查|我去搜|我来查|稍等|马上查)")
+
+FORCE_NOW_HINT = (
+    "【系统提示】你刚才说要查，但其实一次工具都没调——这是空头支票，比不查更糟，"
+    "对方会以为马上有答案，然后永远等不到。现在立刻调用 web_search 查，"
+    "查完直接把结果说出来；不要再回「我查一下」「等我看看」这种话。"
+    "实在查不到就说「查了，网上没有」。"
+)
+
 # 真查到了，却只丢一句话回来——等于白查。让她把有效信息补全。
 EXPAND_HINT = (
     "【系统提示】你刚才已经查到东西了，但回得太少，等于白查。"
@@ -315,20 +328,28 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
     # 她说「不知道」但其实一次都没查——逼她补一轮搜索再重新回答。
     # 这是针对「群友说个听不懂的词，她直接敷衍过去」最直接的修法：
     # 靠 prompt 求她主动查没用，改成事后发现再补救。
-    if (answer and "web_search" not in used and not images
-            and (c.get("search") or {}).get("enable", True)
-            and CONFUSED_RE.search(answer)):
-        log.info("回复露了「不知道」但没查过，补一轮搜索")
-        msgs.append({"role": "assistant", "content": answer})
-        msgs.append({"role": "user", "content": FORCE_SEARCH_HINT})
-        try:
-            retry, used2 = await _chat_loop(msgs, params, ctx or {}, 3)
-        except Exception as exc:
-            log.warning("补搜失败，沿用原回答：%s", exc)
-            retry, used2 = "", set()
-        if retry and "web_search" in used2:
-            answer = retry
-            used = used2      # 补搜这一轮也可能又被下面那层捡起来用
+    # 另一类同样要救：嘴上说「我查一下」却根本没调工具（空头支票）。
+    if answer and "web_search" not in used and not images \
+            and (c.get("search") or {}).get("enable", True):
+        if CONFUSED_RE.search(answer):
+            hint = FORCE_SEARCH_HINT
+            log.info("回复露了「不知道」但没查过，补一轮搜索")
+        elif PROMISE_RE.search(answer):
+            hint = FORCE_NOW_HINT
+            log.info("回复说了「查一下」却没调工具，逼她现在查")
+        else:
+            hint = ""
+        if hint:
+            msgs.append({"role": "assistant", "content": answer})
+            msgs.append({"role": "user", "content": hint})
+            try:
+                retry, used2 = await _chat_loop(msgs, params, ctx or {}, 3)
+            except Exception as exc:
+                log.warning("补搜失败，沿用原回答：%s", exc)
+                retry, used2 = "", set()
+            if retry and "web_search" in used2:
+                answer = retry
+                used = used2      # 补搜这一轮也可能又被下面那层捡起来用
 
     # 真查到了，却只丢一句「五星，热熔」回来——等于白查一次搜索。
     # 让她把查到的有效信息补全再发，只在很短、且确实查过的时候触发。
