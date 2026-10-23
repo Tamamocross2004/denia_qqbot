@@ -13,7 +13,7 @@ if not exist "qqbot\.venv\Scripts\python.exe" (
 )
 
 echo [*] Watchdog starting ...
-echo     Settings live in qqbot\config.json -> watchdog
+echo     Settings live in qqbot\config.json (watchdog section)
 echo     To pause it:  create an empty file  qqbot\logs\watchdog.pause
 echo     To resume:    delete that file
 echo.
