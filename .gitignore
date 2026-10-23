@@ -13,6 +13,8 @@ qqbot/logs/
 # ---------- 本地配置 ----------
 # config.json 里有真实的群号和 QQ 号，仓库里放 config.example.json
 qqbot/config.json
+# notify.json 里有 SMTP 授权码和收件地址，绝不入库
+qqbot/notify.json
 
 # ---------- 依赖与缓存 ----------
 qqbot/.venv/

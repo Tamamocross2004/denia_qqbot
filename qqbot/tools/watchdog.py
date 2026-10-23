@@ -165,6 +165,50 @@ def console_tail(n: int = 8000) -> str:
         return ""
 
 
+def qr_url() -> str:
+    """从控制台里抠出二维码解码 URL（手机上打不开，但可以贴给二维码生成网站）。"""
+    tail = console_tail(20000)
+    for line in reversed(tail.splitlines()):
+        if "二维码解码URL" in line:
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                return parts[1].strip()
+    return ""
+
+
+def send_mail(reason: str) -> None:
+    """把二维码推到手机上：手机 QQ → 扫一扫 → 相册 → 选图 → 确认。"""
+    try:
+        sys.path.insert(0, str(BASE))
+        import mailer
+    except Exception as exc:
+        log.warning("没加载到 mailer：%s", exc)
+        return
+
+    url = qr_url()
+    body = (
+        "达妮娅掉线了，QQ 要求人工验证一次（扫码或短信验证码），自动登录过不去。\n\n"
+        "最快的办法：手机上打开这封信 → 长按/下载下面的二维码图片存到相册\n"
+        "→ 打开手机 QQ → 扫一扫 → 右上角相册 → 选这张图 → 确认。\n\n"
+        f"掉线时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"判定原因：{reason}\n"
+        f"二维码有效期很短，过期就打不开这次登录了。\n"
+    )
+    if url:
+        body += f"\n二维码解码URL（备用）：{url}\n"
+    body += f"\nWebUI 登录页（只在电脑上能开）：{webui_url()}\n"
+    body += f"\n二维码原图：{QR_PNG}\n"
+
+    ok, info = mailer.send(
+        f"[达妮娅] {time.strftime('%H:%M')} 掉线了，扫一下这张码",
+        body, qr_path=str(QR_PNG),
+    )
+    if ok:
+        log.warning("掉线通知邮件：%s", info)
+    else:
+        log.warning("掉线通知邮件没发出去：%s", info)
+
+
 def notify_human(reason: str) -> None:
     """QQ 卡在验证码/扫码上：写说明文件 + 把二维码弹出来，然后别再重启。"""
     msg = (
@@ -182,6 +226,7 @@ def notify_human(reason: str) -> None:
     except Exception:
         pass
     log.error("需要人工登录：%s", reason)
+    send_mail(reason)
     # 二维码弹出来，用户扫一下就完事
     try:
         if QR_PNG.exists():
