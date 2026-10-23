@@ -377,6 +377,9 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
 
 async def send(ws, evt: dict, text: str, quote: bool = False) -> None:
     """quote=True 时带上 reply 段，让消息挂在原消息下面。"""
+    # 最后一道闸：文本出口只在这里和 send_group_text，任何调用方忘了清理
+    # 都会被这里兜住（[[拆]] / [[em:xxx]] 漏到群里是最难看的 bug）
+    text = strip_marks(text)
     if evt.get("message_type") == "group":
         action = "send_group_msg"
         params = {"group_id": evt["group_id"]}
@@ -398,6 +401,7 @@ async def send(ws, evt: dict, text: str, quote: bool = False) -> None:
 async def reply(ws, evt: dict, text: str, quote: bool | None = None) -> None:
     if quote is None:
         quote = bool(trigger_cfg().get("quote_reply", True))
+    text = strip_marks(text)
     size = int(cfg().get("reply_chunk", 800))
     first = True
     for i in range(0, len(text), size):
@@ -730,6 +734,19 @@ STICKER_RE = re.compile(r"\[\[em:([^\[\]]{1,20})\]\]")
 # 拆句标记：模型想连着说两句时用它分隔（最多两条）
 SPLIT_RE = re.compile(r"\[\[\s*(?:拆|分)\s*\]\]")
 _split_hist: dict[str, deque] = {}
+
+# 兜底：任何直接发出去的文本都要过一遍。实测「总结」走的是 reply()，
+# 不经过 reply_with_media，模型写的 [[拆]] 和 [[em:困]] 会原样漏到群里。
+ANY_MARK_RE = re.compile(r"\[\[\s*(?:em:[^\[\]]{1,20}|拆|分)\s*\]\]")
+
+
+def strip_marks(text: str) -> str:
+    """去掉 [[拆]] 和 [[em:xxx]]，顺带收掉留下的多余空格。"""
+    out = ANY_MARK_RE.sub("", text or "")
+    # 中文之间不需要空格：标记删掉后「。 反正」这种要合回去
+    out = re.sub(r"(?<=[^\x00-\x7f])[ \t]+(?=[^\x00-\x7f])", "", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip()
 
 # 模型忘了加标记时的兜底：按回复内容猜情绪。
 # 顺序有意义——越具体的排前面，命中就停。
@@ -1567,6 +1584,7 @@ async def send_group_text(ws, gid: int, text: str) -> bool:
     if ws is None:
         log.warning("没有活动连接，发不了群消息")
         return False
+    text = strip_marks(text)
     try:
         await ws.send(json.dumps({
             "action": "send_group_msg",
