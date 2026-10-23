@@ -246,6 +246,14 @@ FORCE_SEARCH_HINT = (
     "查不到就直说「查了，网上也没有」，不要装作知道。"
 )
 
+# 真查到了，却只丢一句话回来——等于白查。让她把有效信息补全。
+EXPAND_HINT = (
+    "【系统提示】你刚才已经查到东西了，但回得太少，等于白查。"
+    "把查到的有效信息说全：时间、价格、数字、版本号、名字、结论，"
+    "能落几个就落几个；按对方问的那个点组织，别整段照念搜索结果。"
+    "语气还是你那套，不用变正式。"
+)
+
 
 async def ask(key: str, prompt: str, ctx: dict | None = None,
               extra: str = "", images: list[bytes] | None = None) -> str:
@@ -319,6 +327,24 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
             log.warning("补搜失败，沿用原回答：%s", exc)
             retry, used2 = "", set()
         if retry and "web_search" in used2:
+            answer = retry
+            used = used2      # 补搜这一轮也可能又被下面那层捡起来用
+
+    # 真查到了，却只丢一句「五星，热熔」回来——等于白查一次搜索。
+    # 让她把查到的有效信息补全再发，只在很短、且确实查过的时候触发。
+    thin = int((c.get("search") or {}).get("expand_below", 45))
+    if (answer and "web_search" in used and not images
+            and (c.get("search") or {}).get("enable", True)
+            and len(answer) < thin):
+        log.info("查到了但只说了 %d 字，让她补全", len(answer))
+        msgs.append({"role": "assistant", "content": answer})
+        msgs.append({"role": "user", "content": EXPAND_HINT})
+        try:
+            retry, _used3 = await _chat_loop(msgs, params, ctx or {}, 2)
+        except Exception as exc:
+            log.warning("补全失败，沿用原回答：%s", exc)
+            retry = ""
+        if retry and len(retry) > len(answer):
             answer = retry
 
     hist.append({"role": "assistant", "content": answer})
