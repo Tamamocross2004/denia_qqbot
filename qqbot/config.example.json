@@ -70,5 +70,13 @@
   "rate_limit_seconds": 2,
   "reply_chunk": 800,
   "host": "0.0.0.0",
-  "port": 8080
+  "port": 8080,
+  "watchdog": {
+    "enable": true,
+    "check_every": 60,
+    "offline_after": 240,
+    "stale": 1800,
+    "cooldown": 600,
+    "max_per_hour": 3
+  }
 }

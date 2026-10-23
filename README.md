@@ -8,7 +8,8 @@
 
 ```
 deepseek/
-├── start-all.bat          日常一键启动（NapCat + Bot 各开一个窗口）
+├── start-all.bat          日常一键启动（NapCat + Bot + 看门狗，各开一个窗口）
+├── start-watchdog.bat     只看门狗（单独跑时用）
 ├── bin/uv.exe             装依赖用的 uv（pip 在这台机器上连不通索引）
 ├── napcat/                NapCat 4.18.41
 │   ├── run.bat            ← 启动协议端（写死 D:\QQ.exe）
@@ -25,7 +26,9 @@ deepseek/
         ├── check_api.py      验证 key 与模型可用
         ├── setup_napcat.py   把反向 WS 注入 NapCat 配置
         ├── selftest.py       链路自检
-        └── qr_big.py         放大二维码
+        ├── qr_big.py         放大二维码
+        ├── watchdog.py       掉线太久就自动重启 NapCat
+        └── set_napcat_password.py  把 QQ 密码写成 MD5 填进 run.bat（回退登录）
 ```
 
 ## 首次配置
@@ -95,9 +98,73 @@ cd D:/code/deepseek/qqbot
 
 ## 日常启动
 
-双击 `start-all.bat`，两个窗口分别跑 NapCat 和 Bot。
+双击 `start-all.bat`，三个窗口分别跑 NapCat、Bot 和看门狗。
 
 看到 Bot 窗口出现 `监听 ws://0.0.0.0:8080`、NapCat 日志出现 `WebSocket 客户端已连接` 就成了。
+
+## 掉线自愈
+
+机器人号挂在 QQNT 上，服务端会**周期性把这一路的登录态判失效**，日志里长这样：
+
+```
+[KickedOffLine] [下线通知] 你的账号当前登录已失效，请重新登录。
+账号状态变更为离线
+[Core] [Login] 账号已离线，正在重启 Worker 以重新创建 QQ 登录服务
+```
+
+这不是封号：同一批凭证重新登就回来了。真正麻烦的是**它掉了之后不会自己起来**，凌晨没人扫二维码，一躺就是一整夜。
+
+已经验证过的排查结论（10-23 那次，掉线 02:03:07、恢复 08:37:05）：
+
+| 怀疑对象 | 结论 |
+|---|---|
+| Windows 休眠 / 自动更新重启 | 否。系统日志里那段既没有 Kernel-Power 也没有 6005-6009 |
+| QQ 半夜热更新导致版本错配 | 否。`D:\versions` 只有一份，且当晚没有任何文件被改写 |
+| 断网 / QQ 服务挂 | 否。同一台机器上官方 QQ 整晚每小时都在正常写日志 |
+| 别的客户端把这个号挤下线 | 否。bot 账号的数据目录从 02:03 起完全停更，本机没有第二个进程登这个号 |
+| NapCat 自己的自愈 | 只试一次。`napcat.mjs` 里 `qAe()` 在 3.5 秒后调一次 `requestRestartProcess()`，返回成功就收工，不会重试；这次重启时 Chromium 的 network service / GPU process 又崩了，登录流程就卡在那 |
+
+于是补两层保险：
+
+**① 自动回退登录（治根）**
+
+被踢下线时本地 token 一起失效，只配 `NAPCAT_QUICK_ACCOUNT` 的场合，`requestQuickLogin()` 失败后没有下一步，只能落到二维码。给它一个密码：
+
+```bat
+qqbot\.venv\Scripts\python.exe qqbot\tools\set_napcat_password.py
+```
+
+密码用 `getpass` 输入（不回显），只把 MD5 写进 `napcat/run.bat` 的 `NAPCAT_QUICK_PASSWORD_MD5`，明文不落盘。之后 Worker 重启会自己走密码回退登录，不需要扫码也不需要开 WebUI。
+
+> 前提是 bot 号**单独设过 QQ 密码**。一路只靠扫码/手机登录过的号没有密码，得先去 QQ 安全中心设一个。
+
+**② 看门狗（保底）**
+
+`tools/watchdog.py` 只读一个信号：`bot.py` 每 20 秒写一次的 `qqbot/logs/heartbeat.json`。
+
+- 断开持续超过 `offline_after` 秒 → 重启 NapCat
+- 心跳超过 `stale` 秒没更新 → 认为整套都被你关了，不动（免得你自己停了她又被拉起来）
+- `qqbot/logs/watchdog.pause` 这个文件存在 → 暂停，手动维护时用
+- 两次重启之间强制冷却 `cooldown` 秒，一小时最多 `max_per_hour` 次，防止来回拉扯
+
+重启范围严格限制：只 `taskkill /PID <NapCatWinBootMain.exe> /T /F`，官方 QQ 是从 `explorer.exe` 起的另一棵树，**不会被牵连**（这条是实测确认的，别改成按进程名杀）。
+
+```bat
+start-watchdog.bat
+python tools\watchdog.py --once        # 只查一次，试阈值用
+python tools\watchdog.py --dry-run     # 只打印决策，不动真家伙
+```
+
+`qqbot/config.json` 里的 `watchdog` 段：
+
+| 字段 | 说明 |
+|---|---|
+| `enable` | 总开关 |
+| `check_every` | 巡检间隔秒数（默认 60） |
+| `offline_after` | 断线持续多久才动手（默认 240） |
+| `stale` | 心跳多久没更新算「整套停了」（默认 1800） |
+| `cooldown` | 两次重启之间的最小间隔（默认 600） |
+| `max_per_hour` | 一小时最多重启几次（默认 3） |
 
 ## 测试
 
@@ -182,6 +249,9 @@ cd D:/code/deepseek/qqbot
 | `daily.enable` | 日报总开关 |
 | `daily.time` | 每天几点发日报，`HH:MM` 格式（默认 08:30） |
 | `daily.group` | 日报发到哪个群 |
+| `watchdog.enable` | 看门狗总开关，掉线久了自动重启 NapCat（默认 `true`） |
+| `watchdog.offline_after` | 断线持续多少秒才动手（默认 240） |
+| `watchdog.max_per_hour` | 一小时最多重启几次（默认 3），详见「掉线自愈」 |
 | `max_history_turns` | 保留多少轮上下文（内存态，重启即丢） |
 | `rate_limit_seconds` | 同一会话最小间隔，防刷屏 |
 

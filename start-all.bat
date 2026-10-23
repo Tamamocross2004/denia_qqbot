@@ -20,6 +20,8 @@ start "QQ Bot" cmd /c "qqbot\start.bat"
 
 "%SystemRoot%\System32\ping.exe" -n 3 127.0.0.1 >nul
 
+start "Watchdog" cmd /c "start-watchdog.bat"
+
 rem Delete the old QR first, so we can tell whether this run produced a new one.
 rem With quick login enabled a QR usually never appears - that is the good case.
 if exist "napcat\cache\qrcode.png" del /q "napcat\cache\qrcode.png" >nul 2>&1

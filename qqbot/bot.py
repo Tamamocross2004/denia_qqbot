@@ -68,6 +68,35 @@ log = logging.getLogger("qqbot")
 CFG_PATH = BASE / "config.json"
 _cfg_cache: dict = {"mtime": -1.0, "data": {}}
 
+# 给看门狗（tools/watchdog.py）看的存活信号：连上/断开+最后一次状态变化时间。
+HB_PATH = LOG_DIR / "heartbeat.json"
+_hb_state: dict = {"online": None, "since": 0.0}
+
+
+def heartbeat(online: bool) -> None:
+    """每 20 秒刷新一次心跳文件，看门狗据此判断要不要重启 NapCat。"""
+    now = time.time()
+    if _hb_state["online"] != online or not _hb_state["since"]:
+        _hb_state["online"] = online
+        _hb_state["since"] = now
+    try:
+        tmp = HB_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "online": online,
+            "ts": now,
+            "since": _hb_state["since"],
+            "local": datetime.fromtimestamp(_hb_state["since"]).isoformat(timespec="seconds"),
+        }), encoding="utf-8")
+        os.replace(tmp, HB_PATH)
+    except Exception:
+        pass
+
+
+async def heartbeat_loop() -> None:
+    while True:
+        heartbeat(ACTIVE_WS is not None)
+        await asyncio.sleep(20)
+
 
 def cfg() -> dict:
     """读 config.json；文件改动后按 mtime 自动重载。"""
@@ -1949,6 +1978,7 @@ async def handler(ws, *_args):
     global ACTIVE_WS
     ACTIVE_WS = ws
     log.info("NapCat 已连接 %s", getattr(ws, "remote_address", ""))
+    heartbeat(True)
     asyncio.create_task(probe_login(ws))
     try:
         async for raw in ws:
@@ -1979,6 +2009,7 @@ async def handler(ws, *_args):
         if ACTIVE_WS is ws:
             ACTIVE_WS = None
         log.info("NapCat 断开 %s", getattr(ws, "remote_address", ""))
+        heartbeat(False)
 
 
 async def main() -> None:
@@ -1996,6 +2027,8 @@ async def main() -> None:
             log.warning("记忆库初始化失败，这次不记：%s", exc)
     async with ws_serve(handler, HOST, PORT, ping_interval=30, ping_timeout=60):
         log.info("监听 ws://%s:%s  等待 NapCat 反连…", HOST, PORT)
+        heartbeat(False)
+        asyncio.create_task(heartbeat_loop())
         if (cfg().get("daily") or {}).get("enable", True):
             asyncio.create_task(daily_scheduler())
         await asyncio.Future()
