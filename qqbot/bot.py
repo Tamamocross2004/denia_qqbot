@@ -677,6 +677,10 @@ STICKER_DIR = BASE / "stickers"
 STICKER_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 STICKER_RE = re.compile(r"\[\[em:([^\[\]]{1,20})\]\]")
 
+# 拆句标记：模型想连着说两句时用它分隔（最多两条）
+SPLIT_RE = re.compile(r"\[\[\s*(?:拆|分)\s*\]\]")
+_split_hist: dict[str, deque] = {}
+
 # 模型忘了加标记时的兜底：按回复内容猜情绪。
 # 顺序有意义——越具体的排前面，命中就停。
 STICKER_HINTS: list[tuple[str, tuple[str, ...]]] = [
@@ -760,6 +764,54 @@ async def send_image(ws, evt: dict, data: bytes) -> None:
 _sticker_hist: dict[str, deque] = {}
 
 
+def split_reply(text: str, key: str) -> list[str]:
+    """按 [[拆]] 把一条回复拆成两条。
+
+    拆句是为了像真人那样"补一句"，所以：最多两条、每段都得像样、
+    而且连拆三条就强制合回一条（否则会刷屏，QQ 那边也容易盯上）。
+
+    任何走不通的情况都返回去掉标记的整条——错也好、格式也好，
+    标记本身绝不能漏到聊天里。
+    """
+    c = cfg().get("split") or {}
+    # 去掉标记时顺手把留下的连续空格收掉，否则合回一条会变成「嗯  就这样吧」
+    flat = re.sub(r"[ \t]{2,}", " ", SPLIT_RE.sub(" ", text)).strip()
+    if not c.get("enable", True):
+        return [flat]
+    if not SPLIT_RE.search(text):
+        return [flat]
+
+    parts = [p.strip() for p in SPLIT_RE.split(text) if p.strip()]
+    if len(parts) < 2:
+        return [flat]
+
+    max_parts = max(2, int(c.get("max_parts", 2)))
+    if len(parts) > max_parts:
+        parts = parts[:max_parts - 1] + ["".join(parts[max_parts - 1:])]
+
+    # 碎成「嗯」「算了」这种就并回去，别单独发一条只有一个字的消息
+    merged: list[str] = []
+    for p in parts:
+        if merged and len(p) < 2:
+            merged[-1] = merged[-1] + p
+        else:
+            merged.append(p)
+    # 第一条太短也一样（「嗯 [[拆]] 就这样吧」不该拆成两条）
+    if len(merged) >= 2 and len(merged[0]) < 2:
+        merged[1] = merged[0] + merged[1]
+        merged.pop(0)
+    merged = [p for p in merged if p]
+    if len(merged) < 2:
+        return [flat]
+
+    hist = _split_hist.setdefault(key, deque(maxlen=3))
+    if len(hist) == 3 and all(hist):
+        log.info("连着 3 条都在拆句，这条合回一条")
+        return [flat]
+
+    return merged
+
+
 async def reply_with_media(ws, evt: dict, text: str,
                            quote: bool | None = None) -> None:
     """剥掉 [[em:xxx]] 标记：先发文字，再按预算补表情包。
@@ -792,7 +844,18 @@ async def reply_with_media(ws, evt: dict, text: str,
         log.info("连续 %d 条都带图了，这条省掉", streak)
 
     if clean:
-        await reply(ws, evt, clean, quote=quote)
+        parts = split_reply(clean, key)
+        await reply(ws, evt, parts[0], quote=quote)
+        if len(parts) > 1:
+            sp = cfg().get("split") or {}
+            lo = float(sp.get("delay_min", 0.8))
+            hi = max(lo, float(sp.get("delay_max", 2.0)))
+            # 停一下再发第二条，像真人打完一句又想起什么
+            await asyncio.sleep(random.uniform(lo, hi))
+            for p in parts[1:]:
+                await reply(ws, evt, p, quote=False)
+            log.info("拆成 %d 条发出去", len(parts))
+        _split_hist.setdefault(key, deque(maxlen=3)).append(len(parts) > 1)
 
     sent = 0
     if st.get("enable", True) and tags:
