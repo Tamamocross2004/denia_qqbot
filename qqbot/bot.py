@@ -1366,18 +1366,27 @@ async def maybe_chime_in(ws, evt: dict) -> None:
     if n < every:
         IDLE_COUNT[gid] = n
         return
-    IDLE_COUNT[gid] = 0
 
+    # 攒够了，但先过冷却。被挡住时把计数停在 every（而不是清零）——
+    # 清零的话这 10 条就白攒了，还得再等一轮；停住的话冷却一过，
+    # 下一条群消息就能开口。
     now = time.monotonic()
     gap = float(c.get("cooldown", 180))
-    if now - CHIME_LAST.get(gid, 0) < gap:
-        log.info("群里攒够 %d 条了，但上次插话还没过冷却", every)
+    waited = now - CHIME_LAST.get(gid, 0)
+    if waited < gap:
+        IDLE_COUNT[gid] = every
+        log.info("群里攒够 %d 条了，但上次插话才过 %d 秒（冷却 %d 秒）",
+                 every, int(waited), int(gap))
         return
-    CHIME_LAST[gid] = now
 
     bg = recent_context(gid, limit=12)
     if not bg:
+        # 没有群聊缓冲可看（刚启动），这次别浪费掉额度
+        IDLE_COUNT[gid] = every
         return
+
+    IDLE_COUNT[gid] = 0
+    CHIME_LAST[gid] = now
 
     log.info("群 %s 攒够 %d 条闲聊，主动插一句", gid, every)
     extra = (
