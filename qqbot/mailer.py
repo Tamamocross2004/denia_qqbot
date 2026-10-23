@@ -56,7 +56,9 @@ def send(subject: str, body: str, qr_path: str | None = None,
     if not user or not code:
         return False, "notify.json 缺 user 或 auth_code，先跑 tools/set_mail.py"
 
-    host, port = cfg.get("smtp_host") or guess_host(user)
+    default_host, default_port = guess_host(user)
+    host = (cfg.get("smtp_host") or default_host).strip()
+    port = int(cfg.get("smtp_port") or default_port)
     target = to or cfg.get("to") or [user]
     if isinstance(target, str):
         target = [target]
