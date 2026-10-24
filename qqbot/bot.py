@@ -96,7 +96,7 @@ def heartbeat(online: bool) -> None:
 
 async def heartbeat_loop() -> None:
     while True:
-        heartbeat(ACTIVE_WS is not None)
+        heartbeat(bool(WS_CLIENTS))
         await asyncio.sleep(20)
 
 
@@ -1627,6 +1627,10 @@ async def maybe_chime_in(ws, evt: dict) -> None:
 # ---------- 日报 ----------
 
 ACTIVE_WS = None          # NapCat 当前连接，定时任务靠它发消息
+# 所有还活着的客户端。心跳必须看这个而不是 ACTIVE_WS：调试时会同时连
+# tools/selftest.py 和真的协议端，任一客户端断开就把 ACTIVE_WS 置空的话，
+# 心跳会误报离线（10-24 17:47 就这么误报过一次）。
+WS_CLIENTS: set = set()
 LAST_REPORT: dict = {}    # {"date": "2026-10-22", "text": "..."}，当天只生成一次
 
 REPORT_PROMPT = """你在给一个 QQ 群写今天的早报。
@@ -2204,6 +2208,7 @@ async def probe_login(ws) -> None:
 async def handler(ws, *_args):
     global ACTIVE_WS
     ACTIVE_WS = ws
+    WS_CLIENTS.add(ws)
     log.info("NapCat 已连接 %s", getattr(ws, "remote_address", ""))
     heartbeat(True)
     asyncio.create_task(probe_login(ws))
@@ -2233,10 +2238,12 @@ async def handler(ws, *_args):
     except Exception as exc:
         log.warning("连接异常结束：%s", exc)
     finally:
+        WS_CLIENTS.discard(ws)
         if ACTIVE_WS is ws:
-            ACTIVE_WS = None
-        log.info("NapCat 断开 %s", getattr(ws, "remote_address", ""))
-        heartbeat(False)
+            ACTIVE_WS = next(iter(WS_CLIENTS), None)   # 还有别的客户端就不断
+        log.info("NapCat 断开 %s（剩余客户端 %d）",
+                 getattr(ws, "remote_address", ""), len(WS_CLIENTS))
+        heartbeat(bool(WS_CLIENTS))
 
 
 async def main() -> None:
