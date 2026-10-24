@@ -85,5 +85,11 @@
     "stale": 1800,
     "cooldown": 600,
     "max_per_hour": 3
+  },
+  "alert": {
+    "enable": true,
+    "offline_after": 300,
+    "cooldown": 3600,
+    "startup_grace": 180
   }
 }

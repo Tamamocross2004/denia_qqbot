@@ -26,6 +26,8 @@ __pycache__/
 # ---------- 第三方与二进制 ----------
 # napcat 是 112M 的第三方协议端，按 README 自己下载
 napcat/
+# snowluma 是试用中的另一个协议端（111M，含 node.exe），同样不入库
+snowluma/
 bin/
 
 # ---------- 备份与临时 ----------

@@ -12,6 +12,7 @@ import operator
 import os
 import random
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -23,6 +24,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 
 import store
+import mailer
 
 try:
     from websockets.asyncio.server import serve as ws_serve
@@ -96,6 +98,86 @@ async def heartbeat_loop() -> None:
     while True:
         heartbeat(ACTIVE_WS is not None)
         await asyncio.sleep(20)
+
+
+# 掉线邮件提醒：只负责喊人，不负责修。跟看门狗分工——看门狗重生协议端，
+# 这里保底通知。判据和看门狗一样只看 _hb_state，所以 NapCat / SnowLuma 通用。
+_alert_state: dict = {"last_sent": 0.0, "notified": False, "since_offline": 0.0}
+
+
+def backend_name() -> str:
+    """猜现在跑的是哪个协议端——看谁的 WebUI 端口在听。
+
+    只在发信时调用一次，探两个本地端口比拉进程列表便宜。
+    """
+    for port, name in ((6099, "NapCat（WebUI :6099）"),
+                       (5099, "SnowLuma（WebUI :5099）")):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return name
+        except OSError:
+            continue
+    return "未知（6099 / 5099 都没在监听）"
+
+
+async def offline_alert_loop() -> None:
+    c = cfg().get("alert") or {}
+    if not c.get("enable", True):
+        log.info("掉线邮件提醒已关闭（config.alert.enable=false）")
+        return
+    offline_after = float(c.get("offline_after", 300))
+    cooldown = float(c.get("cooldown", 3600))
+    grace = float(c.get("startup_grace", 180))
+    started = time.time()
+    log.info("掉线邮件提醒：离线超 %d 秒发信，冷却 %d 分钟，启动宽限 %d 秒",
+             offline_after, cooldown / 60, grace)
+
+    while True:
+        await asyncio.sleep(20)
+        now = time.time()
+
+        if _hb_state["online"]:
+            if _alert_state["notified"]:
+                log.info("连接恢复，掉线一共 %.0f 分钟",
+                         (now - _alert_state["since_offline"]) / 60)
+                _alert_state["notified"] = False
+            continue
+
+        if now - started < grace:
+            continue                  # 刚启动还没连上，不算掉线
+        since = float(_hb_state["since"] or now)
+        offline_for = now - since
+        if offline_for < offline_after or _alert_state["notified"]:
+            continue
+        if now - _alert_state["last_sent"] < cooldown:
+            continue
+
+        _alert_state["last_sent"] = now
+        _alert_state["notified"] = True
+        _alert_state["since_offline"] = since
+        mins = offline_for / 60
+        body = (
+            f"连接断了，机器人现在是离线状态。\n\n"
+            f"掉线时刻：{datetime.fromtimestamp(since).strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"已掉线：{mins:.0f} 分钟\n"
+            f"bot.py 还活着（不然你收不到这封信）\n"
+            f"当前协议端：{backend_name()}\n\n"
+            f"怎么恢复：\n"
+            f"  · NapCat：双击 start-all.bat。看门狗若没暂停会自动重启；\n"
+            f"    撞到验证码它会另发一封带二维码的邮件。\n"
+            f"  · SnowLuma：看 http://127.0.0.1:5099 的账号状态；\n"
+            f"    QQ 掉登录就重新登录，再在 processes 页对那个 PID 点 load。\n\n"
+            f"这封信由 bot.py 自己发，冷却期内最多一封，连上后自动停止。\n"
+        )
+        try:
+            ok, info = mailer.send(
+                f"[达妮娅] {time.strftime('%H:%M')} 掉线了（已 {mins:.0f} 分钟）", body)
+        except Exception as exc:
+            ok, info = False, f"{type(exc).__name__}: {exc}"
+        if ok:
+            log.warning("掉线提醒邮件已发出：%s", info)
+        else:
+            log.error("掉线提醒邮件发不出去：%s", info)
 
 
 def cfg() -> dict:
@@ -2174,6 +2256,7 @@ async def main() -> None:
         log.info("监听 ws://%s:%s  等待 NapCat 反连…", HOST, PORT)
         heartbeat(False)
         asyncio.create_task(heartbeat_loop())
+        asyncio.create_task(offline_alert_loop())
         if (cfg().get("daily") or {}).get("enable", True):
             asyncio.create_task(daily_scheduler())
         await asyncio.Future()
