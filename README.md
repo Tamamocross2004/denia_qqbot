@@ -205,31 +205,28 @@ qqbot\.venv\Scripts\python.exe qqbot\tools\set_mail.py
 | `qqbot/logs/napcat-console.log` | NapCat 的完整控制台输出（快速登录/密码登录/验证码/二维码链接都在这） |
 | `qqbot/logs/NEEDS_LOGIN.txt` | 只在需要人工登录时出现，写着怎么修；登进去后自动删除 |
 
-### 给 NapCat 一个独立 profile（治"每次都要短信验证"）
+### 给 NapCat 一个独立 profile —— 试过了，对登录态无效
 
-一开始 NapCat 用的是**你官方 QQ 的那个 profile**（`C:\Users\<你>\AppData\Roaming\QQ`），数据根也是同一个（`D:\qqChat\Tencent Files`）。也就是两个不同账号在往同一份设备标识、同一份 msf 会话状态里写东西——密码登录被回一句"短信验证码"，很可能就是这么来的。
+一开始 NapCat 用的是**你官方 QQ 的那个 profile**（`C:\Users\<你>\AppData\Roaming\QQ`），数据根也是同一个（`D:\qqChat\Tencent Files`）。当时的假设是：两个账号往同一份设备标识、同一份 msf 状态里写，才导致密码登录总被要短信验证码。
 
-现在 `napcat\run.bat` 里多了一行，让它跑在自己的 profile 上：
-
-```bat
-set "NAPCAT_PROFILE=D:\qqbot-client\profile"
-if not exist "%NAPCAT_PROFILE%" mkdir "%NAPCAT_PROFILE%"
-set "NAPCAT_QQ_ARGS=--user-data-dir=%NAPCAT_PROFILE%"
-...
-"%NAPCAT_LAUNCHER_PATH%" "%QQEXE%" "%NAPCAT_INJECT_PATH%" %NAPCAT_QQ_ARGS%
-```
-
-实测 `NapCatWinBootMain.exe` 会把多余的参数**原样转发**给 QQ.exe（它自己还会补一个 `-q`）：
+于是 `napcat\run.bat` 里加了 `--user-data-dir=D:\qqbot-client\profile`，并且确认参数确实传到了 QQ：
 
 ```
 Boot Command:"D:\QQ.exe" --enable-logging -q --user-data-dir=D:\qqbot-client\profile
 ```
 
-**注意代价**：新 profile 里没有登录记录，所以要**重扫一次码**；QQ 会把它当成新设备，可能额外要一次短信验证，而且旧 profile 里的会话会被顶掉。`D:\qqbot-client\profile\auth\login.enc` 里还存着数据根路径，所以数据根也会跟着另起一份（不再和官方 QQ 共用 `nt_qq\global`）。
+**结论：这条只隔离了 Electron 的壳，隔不开登录态和设备标识。** 证据（10-24 11:09 那次重启）：
 
-**回滚**：把 `run.bat` 里那三行删掉（或把 `NAPCAT_QQ_ARGS` 置空）再重启即可，原 profile 没被动过。
+| 观察 | 说明 |
+|---|---|
+| 11:09:30 启动 → 11:09:35 适配器就绪 | **5 秒**，走的是快速登录，说明登录记录不是从这个新 profile 读的 |
+| `D:\qqbot-client\profile` 里只有 `Local State` | 没有 `auth/`、`Network/`、`Partitions/` |
+| `D:\qqChat\Tencent Files\3951224783\nt_qq\nt_db\*` 在 11:09 被写 | 账号数据仍在**共享数据根** |
+| 数据根路径存在 `nt_qq\global\nt_data\mmkv\mmkv.default` | 是"数据根里记着数据根"，自举，没法从外部切开 |
 
-**怎么确认生效**：`D:\qqbot-client\profile` 里有 `auth\login.enc`、`Network\` 这些目录；`D:\qqChat\Tencent Files\nt_qq\global\nt_data\msf\machine-info` 的 mtime 不再被 bot 登录刷新。
+也就是说 QQNT 的账号数据、登录态、`machine-info`（设备标识）全在 `Tencent Files` 数据根，不在 Electron profile 里。**所以要真正分开，只能搬数据根；而数据根是全局设置，搬了会连官方 QQ 一起搬**，等于两个实例还是共用。
+
+保留这三行的唯一理由是让两个实例别抢同一份 Chromium 缓存（`Cache/`、`Local Storage`），跟掉线无关。想回到最简状态，删掉 `NAPCAT_QQ_ARGS` 那几行重启即可。
 - 两次重启之间强制冷却 `cooldown` 秒，一小时最多 `max_per_hour` 次，防止来回拉扯
 
 重启范围严格限制：只 `taskkill /PID <NapCatWinBootMain.exe> /T /F`，官方 QQ 是从 `explorer.exe` 起的另一棵树，**不会被牵连**（这条是实测确认的，别改成按进程名杀）。
