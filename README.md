@@ -109,6 +109,24 @@ cd D:/code/deepseek/qqbot
 
 看到 Bot 窗口出现 `监听 ws://0.0.0.0:8080`、NapCat 日志出现 `WebSocket 客户端已连接` 就成了。
 
+### 换成 SnowLuma 启动
+
+SnowLuma 和 NapCat 是二选一的两个协议端，**不能同时挂同一个号**。四步：
+
+1. **双击 `start-snowluma.bat`**。它会暂停看门狗 → 杀掉 NapCat 的 boot main → 只杀 profile 是 `D:\qqbot-client\profile` 的那棵 QQ → 用同一个 profile 重开 QQ → 起 SnowLuma，并在窗口里打印 WebUI 地址和一次性密码。
+2. **确认 QQ 已登录**（账号 3951224783）。数据根里存着登录态，一般几秒就自己快速登录进去；没登上就在 QQ 窗口扫码——**SnowLuma 只支持扫码，没有密码回退**。
+3. **在 WebUI 里挂进程**：打开 `http://127.0.0.1:5099`，登录（密码见 `snowluma/logs/webui-credentials.txt`）→ Processes 页 → 找到 profile 是 `qqbot-client` 的那个 QQ → 点 `load`。
+   **别点错进程**：同一个页面还会列出你自己那个 QQ（默认 profile），挂了会把你的号也接进去。
+4. **双击 `qqbot\start.bat`** 起 bot（8080）。顺序无所谓，SnowLuma 每 5 秒重连一次，bot 后起也能自己连上。
+
+验证：`qqbot/logs/bot.log` 出现 `已连接` + `已登录账号`，SnowLuma 日志出现 `[qqbot] connected ws://127.0.0.1:8080`。
+
+几个坑：
+
+- **`start-snowluma.bat` 不能重复双击**。它会重启 bot 的 QQ（把已挂的 hook 顶掉），还会因为 5099 被占而在 5100 起第二个实例。要重新挂进程只需第 3 步点 `load`，不用整个重来。
+- 只重启 bot 的话，关掉 Bot 窗口再开就行，**别碰 SnowLuma**（它的 QQ 会话不跟着断）。
+- 切回 NapCat：先 `stop-snowluma.bat`（杀 SnowLuma + bot 的 QQ，并解除看门狗暂停），再双击 `start-all.bat`。
+
 ## 掉线自愈
 
 机器人号挂在 QQNT 上，服务端会**周期性把这一路的登录态判失效**，日志里长这样：
