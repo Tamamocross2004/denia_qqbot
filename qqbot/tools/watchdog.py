@@ -80,6 +80,29 @@ DEFAULTS = {
 }
 
 CREATE_NO_WINDOW = 0x08000000
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def spawn_detached(args: list[str], cwd: str | None = None,
+                   stdout=None, stderr=None) -> subprocess.Popen:
+    """起一个不跟着看门狗一起死的进程。
+
+    2026-10-26 实测踩到的：用 `cmd /c start` 起 QQ，外层脚本一退出 QQ 就跟着没了
+    （Windows 8 起子进程会继承 Job 对象，作业被回收时整棵树一起走）。
+    所以这里显式 BREAKAWAY，让它彻底脱离调用者的作业。
+    """
+    flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+    try:
+        return subprocess.Popen(args, cwd=cwd, creationflags=flags, close_fds=True,
+                                stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+    except OSError:
+        # 作业不允许 breakaway 时会 ACCESS_DENIED，退一步仍然尽量独立
+        return subprocess.Popen(args, cwd=cwd,
+                                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                                close_fds=True, stdin=subprocess.DEVNULL,
+                                stdout=stdout, stderr=stderr)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -402,20 +425,28 @@ def _start_snowluma() -> None:
     out = open(SNOW_CONSOLE, "a", encoding="utf-8", errors="replace")
     out.write(f"\n\n===== watchdog restart {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
     out.flush()
-    subprocess.Popen([exe, ".\\index.mjs"], cwd=str(SNOW_DIR),
-                     stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                     creationflags=CREATE_NO_WINDOW)
+    spawn_detached([exe, ".\\index.mjs"], cwd=str(SNOW_DIR), stdout=out, stderr=subprocess.STDOUT)
     log.warning("已拉起 snowluma\\index.mjs")
 
 
 def _wait_snow_online(seconds: int) -> str:
-    """等 bot 的心跳转在线；等不到就判断是不是卡在扫码。"""
+    """等 bot 的心跳转在线，并且确认这次是真的稳住了。
+
+    只看到心跳翻 true 不算数：10-26 实测里有两次「心跳刚转 true、一秒后 QQ 进程就没了」
+    （一次是外层脚本退出把 QQ 带走，一次是 QQ 往已关闭的 stdout 写日志崩掉）。
+    所以转 true 之后要再观察几秒，确认 QQ 进程还在。
+    """
     deadline = time.time() + seconds
     while time.time() < deadline:
         time.sleep(4)
         hb = read_heartbeat()
-        if hb and hb.get("online"):
+        if not (hb and hb.get("online")):
+            continue
+        time.sleep(8)
+        hb2 = read_heartbeat()
+        if hb2 and hb2.get("online") and snowluma_qq_pids():
             return "ok"
+        log.warning("心跳刚转在线又掉了，继续等")
     tail = file_tail(SNOW_LOG_DIR / f"snowluma-{time.strftime('%Y-%m-%d')}.log", 20000)
     if "login detected" in tail:
         return "unknown"          # QQ 登进去了，但 OneBot 还没连上（多半 bot.py 没跑）
@@ -455,9 +486,10 @@ def restart_snowluma(dry: bool) -> str:
         time.sleep(1)
 
     # 3) 用同一个 profile 重开 QQ
-    subprocess.Popen(["cmd", "/c", "start", "", qq_exe, f"--user-data-dir={profile}"],
-                     creationflags=CREATE_NO_WINDOW, stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    #    stdout/stderr 必须显式丢到 DEVNULL：QQ 会往继承来的控制台灌 hotUpdate 日志，
+    #    一旦调用方退出、管道关闭，它写 stdout 失败就直接崩（12:38 那次就是这么死的）。
+    spawn_detached([qq_exe, f"--user-data-dir={profile}"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log.warning("已重开 QQ（profile=%s），等它起来", profile)
 
     new_pid = 0
