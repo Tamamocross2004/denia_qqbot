@@ -8,10 +8,17 @@
 
 ```
 deepseek/
-├── start-all.bat          日常一键启动（NapCat + Bot + 看门狗，各开一个窗口）
+├── start-all.bat          日常一键启动（SnowLuma + Bot + 看门狗）；加参数 napcat 走老路径
+├── start-snowluma.bat     只切协议端：停 NapCat、重开 bot 的 QQ、起 SnowLuma
+├── stop-snowluma.bat      反向操作：停 SnowLuma，交还给 NapCat
 ├── start-watchdog.bat     只看门狗（单独跑时用）
 ├── bin/uv.exe             装依赖用的 uv（pip 在这台机器上连不通索引）
-├── napcat/                NapCat 4.18.41
+├── snowluma/              协议端（2026-10-26 起默认），111M，不入库
+│   ├── launch.ps1         切到 SnowLuma 的全部动作（杀 NapCat -> 重开 QQ -> 起 node）
+│   ├── config/            onebot.json 里 wsClients 指向 bot 的 8080
+│   ├── logs/              webui 密码、控制台输出、每日日志
+│   └── node.exe           自带 Node 24，不用另装
+├── napcat/                NapCat 4.18.41（备用路径）
 │   ├── run.bat            ← 启动协议端（写死 D:\QQ.exe）
 │   ├── config/            OneBot11 配置，登录成功后才会生成
 │   └── cache/qrcode.png   登录二维码
@@ -105,16 +112,18 @@ cd D:/code/deepseek/qqbot
 
 ## 日常启动
 
-双击 `start-all.bat`，三个窗口分别跑 NapCat、Bot 和看门狗。
+双击 `start-all.bat`，三个窗口分别跑 Bot、看门狗和**协议端（默认 SnowLuma）**。
 
-看到 Bot 窗口出现 `监听 ws://0.0.0.0:8080`、NapCat 日志出现 `WebSocket 客户端已连接` 就成了。
+看到 Bot 窗口出现 `监听 ws://0.0.0.0:8080` + `已登录账号`，SnowLuma 日志出现 `[qqbot] connected ws://127.0.0.1:8080` 就成了。
+
+想走老的 NapCat 路径：`start-all.bat napcat`（双击做不到带参数，用命令行，或者临时改一下 `if /i "%~1"=="napcat"` 那句的默认分支）。
 
 ### 换成 SnowLuma 启动
 
 SnowLuma 和 NapCat 是二选一的两个协议端，**不能同时挂同一个号**。四步：
 
 1. **双击 `start-snowluma.bat`**。它会暂停看门狗 → 杀掉 NapCat 的 boot main → 只杀 profile 是 `D:\qqbot-client\profile` 的那棵 QQ → 用同一个 profile 重开 QQ → 起 SnowLuma，并在窗口里打印 WebUI 地址和一次性密码。
-2. **确认 QQ 已登录**（账号 3951224783）。数据根里存着登录态，一般几秒就自己快速登录进去；没登上就在 QQ 窗口扫码——**SnowLuma 只支持扫码，没有密码回退**。
+2. **确认 QQ 已登录**（bot 账号）。数据根里存着登录态，一般几秒就自己快速登录进去；没登上就在 QQ 窗口扫码——**SnowLuma 只支持扫码，没有密码回退**。
 3. **在 WebUI 里挂进程**：打开 `http://127.0.0.1:5099`，登录（密码见 `snowluma/logs/webui-credentials.txt`）→ Processes 页 → 找到 profile 是 `qqbot-client` 的那个 QQ → 点 `load`。
    **别点错进程**：同一个页面还会列出你自己那个 QQ（默认 profile），挂了会把你的号也接进去。
 4. **双击 `qqbot\start.bat`** 起 bot（8080）。顺序无所谓，SnowLuma 每 5 秒重连一次，bot 后起也能自己连上。
@@ -244,6 +253,35 @@ qqbot\.venv\Scripts\python.exe qqbot\tools\set_mail.py
 | `qqbot/logs/napcat-console.log` | NapCat 的完整控制台输出（快速登录/密码登录/验证码/二维码链接都在这） |
 | `qqbot/logs/NEEDS_LOGIN.txt` | 只在需要人工登录时出现，写着怎么修；登进去后自动删除 |
 
+### SnowLuma 怎么被看门狗重启（2026-10-26 起）
+
+先说为什么换：NapCat 那套的掉线是**登录后约 2 小时**的会话寿命问题（9 次里 6 次落在 104–148 分钟），而且每天必掉。换成 SnowLuma 之后的实测：
+
+| 会话 | 起止 | 时长 |
+|---|---|---|
+| 第一次 | 10-24 14:58 → 10-25 07:59（bot 侧重启，不是被踢） | **17 小时 01 分** |
+| 第二次 | 10-25 11:38 → 10-26 11:07 仍在 | **23 小时 29 分** |
+
+两次合计约 40 小时，`KickedOffLine` 零次。心跳 `since` 在这 23 小时里一次都没被重置——这个值只有「所有 WS 客户端都断开」才会变，所以它等价于「OneBot 会话零断连」。
+
+看门狗现在两种后端都认（`watchdog.backend=auto`，按 WebUI 端口判断）。SnowLuma 模式下的重启动作和 NapCat 完全不是一回事：
+
+| 步 | 动作 | 为什么 |
+|---|---|---|
+| 1 | 检查 `snowluma\index.mjs` 的 node 进程，没了就先拉起来 | 那个黑窗口被手滑关掉过 |
+| 2 | `taskkill /PID <pid> /T /F` 杀掉**命令行含 `qqbot-client`** 的 QQ 树 | 你官方 QQ 用的是默认 profile，永远不可能命中这条 |
+| 3 | 用同一个 profile 重开 `D:\QQ.exe --user-data-dir=...` | 数据根里存着登录态，通常几秒就自己登回去 |
+| 4 | 登录 WebUI（密码读 `snowluma/logs/webui-credentials.txt`）→ `POST /api/processes/<新pid>/load` | `hookAutoLoad` 是**故意关掉**的，见下 |
+
+**为什么不开 `hookAutoLoad`**：它会对「新发现的 QQ 进程」一律注入。你自己那台官方 QQ 万一重启一次，就会被它顺手挂上——那是别人的号，绝对不能碰。所以看门狗按 PID 精确挂。
+
+**判据也不同**：NapCat 靠控制台关键字（`需要验证码` / `二维码已保存到`）判断要不要停手；SnowLuma 没有这些，改成看「重启之后有没有出现 `login detected`」——没有就是停在扫码页，判定要人工，发邮件后停手。
+
+两个已知上限，别当成永远不会坏：
+
+- **QQ 自动升级**到 SnowLuma 还没适配的 build → hook 加载失败。它没有按 build 的版本表，容错好，但不是无限的
+- **扫码这一步机器替不了**。SnowLuma 只支持扫码，没有 NapCat 那种密码回退，所以真掉登录时只能人扫一次
+
 ### 给 NapCat 一个独立 profile —— 试过了，对登录态无效
 
 一开始 NapCat 用的是**你官方 QQ 的那个 profile**（`C:\Users\<你>\AppData\Roaming\QQ`），数据根也是同一个（`D:\qqChat\Tencent Files`）。当时的假设是：两个账号往同一份设备标识、同一份 msf 状态里写，才导致密码登录总被要短信验证码。
@@ -260,7 +298,7 @@ Boot Command:"D:\QQ.exe" --enable-logging -q --user-data-dir=D:\qqbot-client\pro
 |---|---|
 | 11:09:30 启动 → 11:09:35 适配器就绪 | **5 秒**，走的是快速登录，说明登录记录不是从这个新 profile 读的 |
 | `D:\qqbot-client\profile` 里只有 `Local State` | 没有 `auth/`、`Network/`、`Partitions/` |
-| `D:\qqChat\Tencent Files\3951224783\nt_qq\nt_db\*` 在 11:09 被写 | 账号数据仍在**共享数据根** |
+| `D:\qqChat\Tencent Files\<bot QQ>\nt_qq\nt_db\*` 在 11:09 被写 | 账号数据仍在**共享数据根** |
 | 数据根路径存在 `nt_qq\global\nt_data\mmkv\mmkv.default` | 是"数据根里记着数据根"，自举，没法从外部切开 |
 
 也就是说 QQNT 的账号数据、登录态、`machine-info`（设备标识）全在 `Tencent Files` 数据根，不在 Electron profile 里。**所以要真正分开，只能搬数据根；而数据根是全局设置，搬了会连官方 QQ 一起搬**，等于两个实例还是共用。
@@ -373,7 +411,11 @@ cd D:/code/deepseek/qqbot
 | `split.enable` | 允不允许她把一条回复拆成两条发（默认 `true`） |
 | `split.max_parts` | 最多拆几条（默认 2），超出部分并回最后一条 |
 | `split.delay_min` / `delay_max` | 两条之间的停顿区间（秒），默认 0.8～2.0 |
-| `watchdog.enable` | 看门狗总开关，掉线久了自动重启 NapCat（默认 `true`） |
+| `watchdog.enable` | 看门狗总开关，掉线久了自动重启协议端（默认 `true`） |
+| `watchdog.backend` | `auto` / `napcat` / `snowluma`。auto 按端口判断：5099 在听＝SnowLuma，6099 在听＝NapCat |
+| `watchdog.snowluma.qq_exe` | SnowLuma 模式下重开 QQ 用的可执行文件（默认 `D:\QQ.exe`） |
+| `watchdog.snowluma.qq_profile` | bot 用的 QQ profile，重启时按它来认进程、也按它重开（默认 `D:\qqbot-client\profile`） |
+| `watchdog.snowluma.login_wait` | 重启后等它自动登录的时间（秒，默认 180），超时就判定要人工 |
 | `watchdog.offline_after` | 断线持续多少秒才动手（默认 240） |
 | `watchdog.max_per_hour` | 一小时最多重启几次（默认 3），详见「掉线自愈」 |
 | `max_history_turns` | 保留多少轮上下文（内存态，重启即丢） |

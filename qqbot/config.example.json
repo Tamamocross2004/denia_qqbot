@@ -84,7 +84,14 @@
     "offline_after": 240,
     "stale": 1800,
     "cooldown": 600,
-    "max_per_hour": 3
+    "max_per_hour": 3,
+    "backend": "auto",
+    "snowluma": {
+      "webui": "http://127.0.0.1:5099",
+      "qq_exe": "D:\\QQ.exe",
+      "qq_profile": "D:\\qqbot-client\\profile",
+      "login_wait": 180
+    }
   },
   "alert": {
     "enable": true,
