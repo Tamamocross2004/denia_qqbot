@@ -1,3 +1,5 @@
 websockets>=13.0
 openai>=1.40.0
 edge-tts
+# 看视频：音频转文字。small 模型约 464MB，首次会自动下载到 ~/.cache/huggingface
+faster-whisper>=1.2.0

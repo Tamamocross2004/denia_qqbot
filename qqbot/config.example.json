@@ -98,5 +98,20 @@
     "offline_after": 300,
     "cooldown": 3600,
     "startup_grace": 180
+  },
+  "video": {
+    "enable": true,
+    "proactive": true,
+    "proactive_gap": 2700,
+    "proactive_within": 1800,
+    "max_seconds": 600,
+    "timeout": 300,
+    "cache_days": 7,
+    "asr": {
+      "enable": true,
+      "model": "small",
+      "device": "cpu",
+      "compute_type": "int8"
+    }
   }
 }

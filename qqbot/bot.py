@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 
 import store
 import mailer
+import video
 
 try:
     from websockets.asyncio.server import serve as ws_serve
@@ -411,7 +412,10 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
     # 这是针对「群友说个听不懂的词，她直接敷衍过去」最直接的修法：
     # 靠 prompt 求她主动查没用，改成事后发现再补救。
     # 另一类同样要救：嘴上说「我查一下」却根本没调工具（空头支票）。
-    if answer and "web_search" not in used and not images \
+    # 但看视频那一轮例外：转写里专有名词本来就糊，她说「没看懂」是实话，
+    # 逼她补搜只会搜出一堆无关东西。
+    video_turn = "【群友分享的视频】" in extra
+    if answer and "web_search" not in used and not images and not video_turn \
             and (c.get("search") or {}).get("enable", True):
         if CONFUSED_RE.search(answer):
             hint = FORCE_SEARCH_HINT
@@ -591,6 +595,24 @@ TOOLS_SPEC = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "video_info",
+            "description": ("查一个视频链接的标题、UP主、时长、播放量和网友热评。"
+                            "群里有人发了视频、你想接话或想确认是什么片子时用它。"
+                            "只给标题和热评，不解说内容（要看内容得让对方单独发一次链接）。"
+                            "不是视频链接、或你已经有标题时别调。"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string",
+                            "description": "视频链接，B站、b23.tv 短链都行"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 _BINOPS = {
@@ -761,6 +783,25 @@ def remember_search(query: str, top: dict) -> None:
         log.warning("写入 auto 词典失败：%s", exc)
 
 
+async def tool_video_info(args: dict, ctx: dict) -> str:
+    """只看标题/热评/已缓存的转写。不现场跑 ASR——那是分钟级的，会把工具拖死。"""
+    if not (cfg().get("video") or {}).get("enable", True):
+        return "看视频这个功能被关掉了。"
+    url = str(args.get("url") or "").strip()
+    if not url.startswith("http"):
+        return "这不是一个链接。"
+
+    try:
+        info = await asyncio.wait_for(video.fetch_async(url), timeout=20)
+    except Exception as exc:
+        return f"抓不到这个链接：{exc}"
+    if not info.get("title"):
+        return "这个链接抓不到内容，可能不是视频，或者平台要登录。"
+
+    cached = store.get_video(info.get("id") or "") or {}
+    return video.describe(info, cached.get("transcript") or "")
+
+
 async def tool_web_search(args: dict, ctx: dict) -> str:
     if not (cfg().get("search") or {}).get("enable", True):
         return "搜索功能被关掉了。"
@@ -801,6 +842,8 @@ async def run_tool(name: str, args: dict, ctx: dict) -> str:
             return await tool_group_info(args, ctx)
         if name == "web_search":
             return await tool_web_search(args, ctx)
+        if name == "video_info":
+            return await tool_video_info(args, ctx)
         return f"没有叫 {name} 的工具"
     except Exception as exc:
         log.warning("工具 %s 出错：%s", name, exc)
@@ -1193,6 +1236,9 @@ def _brief(evt: dict) -> str:
             parts.append(f"@{data.get('qq')}")
         elif kind == "reply":
             parts.append("[回复]")
+        elif kind in ("json", "xml", "share", "video"):
+            # 分享卡片以前整段被丢掉，等于她连"谁发了条视频"都不知道
+            parts.append(video.brief_of(s))
     return "".join(parts).strip()
 
 
@@ -1227,6 +1273,11 @@ def remember(evt: dict) -> bool:
     uid = int(evt.get("user_id") or 0)
     GROUP_RECENT.setdefault(gid, deque(maxlen=RECENT_MAX)).append(
         (str(uid), line))
+
+    # 群里有人发视频就记一笔：等插话时可以捡来吐槽，不需要 @ 她
+    if (cfg().get("video") or {}).get("enable", True):
+        for link in video.links(evt):
+            video.note_share(gid, link, uid, _nick_of_evt(evt))
 
     if not _group_tracked(gid):
         return False
@@ -1569,6 +1620,107 @@ def reset_chime(gid) -> None:
         IDLE_COUNT[gid] = 0
 
 
+# ---------- 视频链接 ----------
+
+VIDEO_ACK = (
+    "……我看看。",
+    "等等，我点开瞅一眼。",
+    "嗯，我看看这是什么。",
+    "……行，我瞄一眼。",
+)
+# 有人只是甩链接、不问什么，也当成"让我看"
+VIDEO_WANT_RE = re.compile(
+    r"(看看|看一下|瞅瞅|讲讲|说说|这视频|这链接|值不值得|好看吗|讲了啥|讲什么)")
+VIDEO_BUSY: set[str] = set()      # 同一个视频别并发跑两遍
+VIDEO_PICK_LAST: dict[int, float] = {}
+
+
+async def video_answer(ws, evt: dict, link: dict, question: str) -> None:
+    """先应一声，再去读；读完补一条评论。
+
+    被 @ 或被点名要看时才走这里。ASR 是分钟级的，所以不能堵在消息处理
+    里——调用方 create_task 之后立刻 return。
+    """
+    vc = cfg().get("video") or {}
+    url = link.get("url") or ""
+    tag = video.video_id(url) or url
+    if tag in VIDEO_BUSY:
+        return
+    VIDEO_BUSY.add(tag)
+    key = session_key(evt)
+    try:
+        try:
+            info = await asyncio.wait_for(
+                video.fetch_async(url, link.get("title") or "",
+                                  bool(link.get("direct"))), timeout=25)
+        except Exception as exc:
+            log.warning("抓视频信息失败：%s", exc)
+            info = {}
+        if not info.get("title"):
+            await reply(ws, evt, "……这链接我打不开，你自己看吧。")
+            return
+
+        transcript = ""
+        asr = vc.get("asr") or {}
+        if info.get("audio") and asr.get("enable", True):
+            try:
+                transcript = await asyncio.wait_for(
+                    video.transcript_async(info, asr,
+                                           int(vc.get("max_seconds", 600))),
+                    timeout=float(vc.get("timeout", 300)))
+            except asyncio.TimeoutError:
+                log.warning("视频转写超时：%s", info.get("id"))
+            except Exception as exc:
+                log.warning("视频转写失败：%s", exc)
+        log.info("[video %s] 《%s》转写 %d 字",
+                 info.get("id"), (info.get("title") or "")[:28], len(transcript))
+
+        body = video.describe(info, transcript)
+        extra = (
+            f"{body}\n\n"
+            "【这是群友刚发到群里的视频，你刚看完。用你自己的口气说两句："
+            "先给你的判断——值不值得看、哪里有问题、有没有标题党；"
+            "可以吐槽 UP 主、标题和热评，也可以接一个内容里的具体细节。"
+            "不要复述、不要逐条总结、不要说「视频中提到」这种话。"
+            "转写是机器识别的，专有名词写错就别硬叫名字。】")
+        ask_q = (question or "").strip() or "（他什么都没说，就甩了个链接过来）"
+        answer = await ask(key, ask_q,
+                           {"ws": ws, "evt": evt, "group_id": evt.get("group_id")},
+                           extra=extra)
+        log.info("[video %s] Q=%r A=%r", info.get("id"), ask_q[:30], answer[:40])
+        video.mark_done(evt.get("group_id"), info.get("id") or tag)
+        await reply_with_media(ws, evt, answer, quote=True)
+    finally:
+        VIDEO_BUSY.discard(tag)
+
+
+async def maybe_pick_video(gid) -> str:
+    """挑一条没人接话的视频，返回要塞给她的背景；没有就返回空串。"""
+    vc = cfg().get("video") or {}
+    if not vc.get("enable", True) or not vc.get("proactive", True):
+        return ""
+    now = time.monotonic()
+    gap = float(vc.get("proactive_gap", 2700))
+    if now - VIDEO_PICK_LAST.get(gid, 0) < gap:
+        return ""
+    pick = video.pick_fresh(gid, float(vc.get("proactive_within", 1800)))
+    if not pick:
+        return ""
+    try:
+        info = await asyncio.wait_for(
+            video.fetch_async(pick["url"], pick.get("title") or "",
+                              bool(pick.get("direct"))), timeout=20)
+    except Exception:
+        return ""
+    if not info.get("title"):
+        return ""
+    cached = store.get_video(info.get("id") or "") or {}
+    VIDEO_PICK_LAST[gid] = now
+    video.mark_done(gid, info.get("id") or pick.get("vid") or "")
+    log.info("[chime %s] 捡到一个没人理的视频：%s", gid, (info.get("title") or "")[:30])
+    return video.describe(info, cached.get("transcript") or "")
+
+
 async def maybe_chime_in(ws, evt: dict) -> None:
     """群聊里没人叫她时计数，攒够 N 条就主动插一句。"""
     c = cfg().get("chime") or {}
@@ -1606,13 +1758,23 @@ async def maybe_chime_in(ws, evt: dict) -> None:
     CHIME_LAST[gid] = now
 
     log.info("群 %s 攒够 %d 条闲聊，主动插一句", gid, every)
-    extra = (
-        "【群里刚才在聊，这些都是别人说的，不是你自己的经历】\n"
-        f"{bg}\n"
-        "【现在没人叫你。你要突然冒个泡，顺着话题插一句。"
-        "要求：不点名、不 @ 任何人、一两句话就行，"
-        "像群里随口接一嘴；别总结、别复述别人说过的，"
-        "也别问「你们在聊什么」这种废话。】")
+    picked = await maybe_pick_video(gid)
+    if picked:
+        extra = (
+            f"【群里刚才有人发了这个视频，发完就没人接话，冷在那儿了】\n"
+            f"{picked}\n"
+            "【现在没人叫你。你要突然冒个泡，就这个视频说一句："
+            "可以吐槽标题党、UP 主、热评，或者接一个内容里的具体细节。"
+            "要求：不点名、不 @ 任何人、一两句话，像群里随口接一嘴；"
+            "别复述、别总结、别说「视频中提到」。】")
+    else:
+        extra = (
+            "【群里刚才在聊，这些都是别人说的，不是你自己的经历】\n"
+            f"{bg}\n"
+            "【现在没人叫你。你要突然冒个泡，顺着话题插一句。"
+            "要求：不点名、不 @ 任何人、一两句话就行，"
+            "像群里随口接一嘴；别总结、别复述别人说过的，"
+            "也别问「你们在聊什么」这种废话。】")
     try:
         answer = await ask(f"g{gid}", "（没人叫你，但你一直在看着群聊，忍不住插一句）",
                            {"ws": ws, "evt": evt, "group_id": gid}, extra=extra)
@@ -2085,6 +2247,23 @@ async def handle(ws, evt: dict) -> None:
             await reply(ws, evt, err)
         return
 
+    # 群友甩来一个视频/链接：先应一声，后台读完再补一条。
+    # 放在指令之后、限流之前——ASR 是分钟级的，绝不能堵在这条消息的处理里。
+    vc = cfg().get("video") or {}
+    if vc.get("enable", True):
+        found = video.links(evt)
+        if found:
+            link = found[0]
+            video.note_share(evt.get("group_id"), link, evt.get("user_id"),
+                             _nick_of_evt(evt))
+            addressed = (at_me(evt) or name_hit(text)
+                         or bool(VIDEO_WANT_RE.search(text)))
+            # all 模式下每条群消息都会进来，没人叫她时别自动去跑 ASR
+            if mode != "all" or addressed:
+                await reply(ws, evt, random.choice(VIDEO_ACK))
+                asyncio.create_task(video_answer(ws, evt, link, text))
+                return
+
     now = time.monotonic()
     if now - last_seen.get(key, 0) < float(cfg().get("rate_limit_seconds", 2)):
         return
@@ -2259,6 +2438,10 @@ async def main() -> None:
             restore_recent()
         except Exception as exc:
             log.warning("记忆库初始化失败，这次不记：%s", exc)
+    try:
+        video.cleanup(int((cfg().get("video") or {}).get("cache_days", 7)))
+    except Exception as exc:
+        log.warning("清视频缓存失败（不影响聊天）：%s", exc)
     async with ws_serve(handler, HOST, PORT, ping_interval=30, ping_timeout=60):
         log.info("监听 ws://%s:%s  等待 NapCat 反连…", HOST, PORT)
         heartbeat(False)

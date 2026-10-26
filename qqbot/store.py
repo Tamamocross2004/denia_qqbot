@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS memory(
     used_at INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_mem_gid ON memory(gid, uid);
+
+-- 视频转写缓存：同一个视频只跑一次 ASR
+CREATE TABLE IF NOT EXISTS video(
+    vid        TEXT PRIMARY KEY,      -- B站用 bvid，其它平台用 "平台:id"
+    title      TEXT,
+    up         TEXT,
+    seconds    INTEGER DEFAULT 0,
+    transcript TEXT,
+    ts         INTEGER NOT NULL
+);
 """
 
 
@@ -283,3 +293,42 @@ def memories_for(gid: int, uids: list[int] | None = None,
                    [int(time.time())] + ids)
         db.commit()
     return [dict(r) for r in rows]
+
+
+# ---------- 视频转写缓存 ----------
+
+def get_video(vid: str, max_age: int = 604800) -> dict | None:
+    """取缓存的转写。超过 max_age 秒就当没有（内容会变、也会占地方）。"""
+    if not vid:
+        return None
+    db = connect()
+    row = db.execute(
+        "SELECT vid, title, up, seconds, transcript, ts FROM video WHERE vid=?",
+        (vid,)).fetchone()
+    if not row:
+        return None
+    if max_age and time.time() - int(row["ts"] or 0) > max_age:
+        return None
+    return dict(row)
+
+
+def save_video(vid: str, title: str, up: str, seconds: int, transcript: str) -> None:
+    if not vid:
+        return
+    db = connect()
+    db.execute(
+        "INSERT INTO video(vid, title, up, seconds, transcript, ts) VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(vid) DO UPDATE SET title=excluded.title, up=excluded.up, "
+        "seconds=excluded.seconds, transcript=excluded.transcript, ts=excluded.ts",
+        (vid, (title or "")[:200], (up or "")[:80], int(seconds or 0),
+         transcript or "", int(time.time())))
+    db.commit()
+
+
+def prune_video(keep_days: int = 7) -> None:
+    if not keep_days:
+        return
+    db = connect()
+    db.execute("DELETE FROM video WHERE ts < ?",
+               (int(time.time()) - keep_days * 86400,))
+    db.commit()

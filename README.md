@@ -28,6 +28,7 @@ deepseek/
     ├── memory.db          记忆库，首次运行自动生成
     ├── mailer.py          掉线通知发信（SMTP）
     ├── notify.json        SMTP 账号/授权码/收件人（不入库，set_mail.py 生成）
+    ├── video.py          看群友发的视频（抓链接 → 元数据 → 音频转写）
     ├── lore.json          她认识的人 + 世界名词
     ├── voicelines.json    官方语音台词库（写人设时的语感参照，不注入）
     ├── relations.json     人物关系网
@@ -399,6 +400,10 @@ cd D:/code/deepseek/qqbot
 | `vision.enable` | 允不允许看图。关掉后图片只当 `[图片]` 处理 |
 | `vision.model` | 视觉模型，默认 `deepseek-v4-flash-vision-exp` |
 | `vision.max_images` | 一条消息最多看几张 |
+| `video.enable` | 允不允许看群友发的视频链接。关掉后链接只当普通消息 |
+| `video.proactive` | 没人理她时，自己捡半小时内没人接话的视频吐槽 |
+| `video.max_seconds` | 转写最多取前多少秒（默认 600），长视频不会被拖死 |
+| `video.asr` | 转写模型，默认 `small / cpu / int8`，换 `medium` 会慢 3 倍 |
 | `chime.enable` | 没被叫到时主动插话的总开关 |
 | `chime.every` | 攒够多少条没人叫她的消息，她就自己冒一句（默认 10） |
 | `chime.cooldown` | 两次主动插话的最小间隔秒数（默认 180） |
@@ -952,6 +957,81 @@ NapCat 上报的 image 段字段不固定，不同版本给的东西不一样，
 `max_images` 是一条消息最多看几张，超出直接丢。单张上限 6MB。
 
 想关掉就把 `enable` 设为 false，之后发图只当普通消息处理。
+
+## 看视频
+
+群友往群里甩 B站视频，她会真的去看，然后用自己的口气说两句。
+
+### 以前为什么「看不懂」
+
+不是看不懂，是**根本收不到**。`text_of()` 只读 `text` 段，`_brief()` 只认 text/image/face/at/reply，而 QQ 的分享卡片在 OneBot 里是 `json` / `xml` / `share` / `video` 段——整段被丢掉，连「谁发了条视频」都不会进群聊缓冲。现在 `_brief()` 会把它压成 `[视频] 标题`，`video.links()` 负责抽链接。
+
+### 三层，按代价递增
+
+| 层 | 做什么 | 代价 |
+|---|---|---|
+| 抓 | 从 json/xml/share/video 段里挖 URL；`b23.tv` 短链跟一次 302 | 0 |
+| 读 | B站 `x/web-interface/view` 拿标题/UP主/时长/播放/简介，`x/v2/reply` 拿热评 | **0.3~0.7 秒** |
+| 听 | `x/player/playurl?fnval=16` 拿 `dash.audio`（**免登录**）→ ffmpeg 转 16k wav → faster-whisper | 2 分钟视频约 **25 秒**（模型已在内存时） |
+
+只有音频，不下整段视频：10 分钟视频的音频约 5MB，比视频小两个数量级。
+
+### 什么时候才会去「听」
+
+- 链接一进来：**只记一笔**（标题 + 谁发的），写进群聊缓冲，1 秒内完成
+- **被 @、被喊名字、或消息里有「看看 / 讲讲 / 值不值得 / 讲了啥」**：先回一句「……我看看」，后台跑完再补一条评论（`[[拆]]` 那套照常，会拆成两条发）
+- 群里有人发了视频、半小时没人接话，且这个群 45 分钟没捡过视频：**她自己捡起来吐槽**（`video.proactive`）
+- 主动捡的时候只读标题和热评，**不现场跑 ASR**——那是分钟级的，会把插话拖没
+
+同一个视频只转写一次（`video` 表，默认留 7 天），第二次是 0 秒。
+
+### 实测
+
+2 分 18 秒的游戏解说（BV1ZjHV6sE13）：
+
+```
+[transcribe] 43.3s（含首次加载模型）  605 字
+[cached]      0.00s  命中缓存
+答：这游戏解说也就那样，标题比内容精彩 😴
+```
+
+链路各段的真实数字：
+
+| 环节 | 实测 |
+|---|---|
+| 视频信息 + 热评 | 0.3~0.7 秒 |
+| `b23.tv` 短链跳转 | 一次 302，自动跟随 |
+| 音频下载（108 秒视频） | 879KB / 0.46 秒 |
+| ASR（137 秒音频，small int8 CPU） | 22~25 秒，RTF 0.18 |
+| ASR（同一段，medium int8 CPU） | 70 秒，RTF 0.51 —— 太慢，没启用 |
+
+### 四个踩过的坑
+
+1. **B站的 WAF 不认完整的 Chrome UA**。发 `Mozilla/5.0 (Windows NT 10.0...) Chrome/126...` 会被回 `412 Precondition Failed`，只认最朴素的 `Mozilla/5.0`。所以 `video.py` 里 `UA` 和 `UA_BROWSER` 是两个常量。
+2. **`av 19` 和 `faster-whisper 1.2` 不兼容**：`decode_audio()` 传 `metadata_errors` 直接 TypeError。解法是绕开 PyAV，用 `wave` + numpy 喂 float32 数组。
+3. **HuggingFace 的 Xet 存储对镜像返回 401**：必须 `HF_HUB_DISABLE_XET=1` + `HF_ENDPOINT=hf-mirror.com`。
+4. **GPU 暂时用不上**：ctranslate2 缺 `cublas64_12.dll`。补 `nvidia-cublas-cu12` + `nvidia-cudnn-cu12`（约 1GB）之后能提速到 3 秒级，但 CPU 的 25 秒已经够用，先不折腾。
+
+### 配置
+
+```json
+"video": {
+  "enable": true,
+  "proactive": true,          // 没人理她时自己捡视频吐槽
+  "proactive_gap": 2700,      // 同一个群两次捡视频的最短间隔（秒）
+  "proactive_within": 1800,   // 只捡最近半小时发的
+  "max_seconds": 600,         // 超过 10 分钟只转前 10 分钟
+  "timeout": 300,             // 单次转写的总时限
+  "cache_days": 7,
+  "asr": {"enable": true, "model": "small", "device": "cpu", "compute_type": "int8"}
+}
+```
+
+**只支持 B站**（含 b23.tv 短链）。抖音/小红书/YouTube 目前只能抓个 `og:title`，因为它们的音频要签名或要代理，v1 不做。
+
+依赖：`faster-whisper`（已在 `qqbot/.venv` 里），模型 `small` 约 464MB，缓存在 `~/.cache/huggingface`。ffmpeg 直接用 `tts/bin/ffmpeg.exe`。
+
+要不要为了省显存/内存把它关掉：`video.enable = false`，之后视频链接只当普通消息处理。
 
 ## 工具
 
