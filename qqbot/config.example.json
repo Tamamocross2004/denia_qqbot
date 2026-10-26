@@ -104,6 +104,7 @@
     "proactive": true,
     "proactive_gap": 2700,
     "proactive_within": 1800,
+    "link_ttl": 600,
     "max_seconds": 600,
     "timeout": 300,
     "cache_days": 7,

@@ -1631,8 +1631,30 @@ VIDEO_ACK = (
 # 有人只是甩链接、不问什么，也当成"让我看"
 VIDEO_WANT_RE = re.compile(
     r"(看看|看一下|瞅瞅|讲讲|说说|这视频|这链接|值不值得|好看吗|讲了啥|讲什么)")
+# 手机 QQ 是「先发一条链接、再单独 @ 一句」两步，所以被问到时当前这条
+# 往往没有链接，得回头去找刚才那条。这几类话就是在指前面那条视频。
+VIDEO_REF_RE = re.compile(
+    r"(这个视频|那条视频|这条视频|刚才那个|刚发的|上一条|上面的链接|这链接"
+    r"|讲了啥|讲了什么|讲的啥|讲了点啥|值不值得看|视频呢|链接呢|哪个视频|什么视频)")
+_VIDEO_BARE_RE = re.compile(
+    r"((?:这|那|这个|那个)(?:个)?(?:视频|链接|片)|看看|看下|看一下|瞅瞅|说说|讲讲|讲一下)"
+    r"[吧啊呀哦。！!？?~]*")
 VIDEO_BUSY: set[str] = set()      # 同一个视频别并发跑两遍
 VIDEO_PICK_LAST: dict[int, float] = {}
+
+
+def looks_about_video(text: str) -> bool:
+    """这句话是不是在指某个视频/链接（而不是在聊别的）。
+
+    「视频」两个字本身太泛，得配短句或明确的指代才算——不然有人
+    @ 她说「这视频网站好卡」也会被当成要她去看片。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if VIDEO_REF_RE.search(t):
+        return True
+    return bool(_VIDEO_BARE_RE.fullmatch(t))
 
 
 async def video_answer(ws, evt: dict, link: dict, question: str) -> None:
@@ -2252,10 +2274,22 @@ async def handle(ws, evt: dict) -> None:
     vc = cfg().get("video") or {}
     if vc.get("enable", True):
         found = video.links(evt)
+        reused = False
+        if not found and looks_about_video(text):
+            # 手机 QQ 的两步操作：链接发在群里、@ 是另一条。
+            # 这时回头找刚才那条分享，否则她只能干巴巴说一句「我又没点开看」。
+            recent = video.pick_recent(evt.get("group_id"),
+                                       float(vc.get("link_ttl", 600)))
+            if recent:
+                found = [recent]
+                reused = True
+                log.info("这条消息没链接，沿用刚才分享的视频：%s",
+                         recent.get("title") or recent.get("vid"))
         if found:
             link = found[0]
-            video.note_share(evt.get("group_id"), link, evt.get("user_id"),
-                             _nick_of_evt(evt))
+            if not reused:
+                video.note_share(evt.get("group_id"), link, evt.get("user_id"),
+                                 _nick_of_evt(evt))
             addressed = (at_me(evt) or name_hit(text)
                          or bool(VIDEO_WANT_RE.search(text)))
             # all 模式下每条群消息都会进来，没人叫她时别自动去跑 ASR

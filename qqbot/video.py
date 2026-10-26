@@ -128,6 +128,27 @@ def _from_xml_seg(raw: str) -> list[dict]:
     return out
 
 
+def _dump_card(kind: str, data: dict) -> None:
+    """认不出来的卡片存一份原始结构，下次照着它补解析。
+
+    手机 QQ 和小程序的卡片结构跟电脑端不一样，光靠猜补不完。
+    """
+    try:
+        path = BASE / "logs" / "video-unparsed.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 512 * 1024:
+            path.replace(path.with_name("video-unparsed.1.jsonl"))
+        trimmed = {}
+        for k, v in (data or {}).items():
+            trimmed[k] = v[:2000] if isinstance(v, str) else v
+        line = json.dumps({"ts": int(time.time()), "type": kind, "data": trimmed},
+                          ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
 def links(evt: dict) -> list[dict]:
     """把一条消息里能当视频/链接看的东西都挖出来，按出现顺序去重。"""
     raw: list[dict] = []
@@ -136,24 +157,27 @@ def links(evt: dict) -> list[dict]:
             continue
         kind = seg.get("type")
         data = seg.get("data") or {}
+        got: list[dict] = []
         if kind == "text":
-            for u in _urls_in(data.get("text") or ""):
-                raw.append({"url": u, "title": ""})
+            got = [{"url": u, "title": ""} for u in _urls_in(data.get("text") or "")]
         elif kind == "json":
-            raw += _from_json_seg(str(data.get("data") or ""))
+            got = _from_json_seg(str(data.get("data") or ""))
         elif kind == "xml":
-            raw += _from_xml_seg(str(data.get("data") or ""))
+            got = _from_xml_seg(str(data.get("data") or ""))
         elif kind == "share":
             url = str(data.get("url") or "")
             if url.startswith("http"):
-                raw.append({"url": _clean_url(url),
-                            "title": str(data.get("title") or "")[:120]})
+                got = [{"url": _clean_url(url),
+                        "title": str(data.get("title") or "")[:120]}]
         elif kind == "video":
             url = str(data.get("url") or "")
             if url.startswith("http"):
                 # 群友直接发的视频文件：不用元数据，下下来自己抽音轨
-                raw.append({"url": _clean_url(url), "title": "[群里的视频]",
-                            "direct": True})
+                got = [{"url": _clean_url(url), "title": "[群里的视频]",
+                        "direct": True}]
+        if kind in ("json", "xml", "share", "video") and not got:
+            _dump_card(kind, data)
+        raw += got
 
     seen: set[str] = set()
     out: list[dict] = []
@@ -570,6 +594,22 @@ def pick_fresh(gid, within: float = 1800) -> dict | None:
             continue
         return item
     return None
+
+
+def pick_recent(gid, within: float = 600) -> dict | None:
+    """最近发过的那一条，不管她有没有评论过。
+
+    手机 QQ 分享是「先甩一条链接、再单独 @ 一句看看」两步，
+    所以被问到时当前消息里多半没有链接，得回头去找上一条。
+    """
+    if not gid:
+        return None
+    now = time.time()
+    best = None
+    for item in _shares.get(int(gid), []):
+        if now - item["ts"] <= within:
+            best = item
+    return best
 
 
 def mark_done(gid, vid: str) -> None:
