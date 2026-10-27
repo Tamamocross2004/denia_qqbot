@@ -20,6 +20,7 @@ import urllib.request
 import uuid
 from collections import deque
 from datetime import datetime, timedelta
+from fractions import Fraction
 from pathlib import Path
 
 from openai import AsyncOpenAI
@@ -563,12 +564,16 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "calc",
-            "description": "精确计算数学表达式。涉及四则运算、乘方、取余时用它，不要自己心算。",
+            "description": (
+                "精确计算，别自己心算。两种用法：① 纯算式求值，如 (1200-350)*3/7；"
+                "② 一元等式求未知数，如 (1-x)/(1+x)=2/11 或 3*x+2=11，"
+                "会返回解并把解代回验算。乘号写 *，乘方写 **，别写 × 或 3x。"),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "expression": {"type": "string",
-                                   "description": "算式，如 (1200-350)*3/7 或 2**10 % 7"},
+                                   "description": "算式或一元等式。如 (1200-350)*3/7、"
+                                                  "2**10 % 7、(1-x)/(1+x)=2/11"},
                 },
                 "required": ["expression"],
             },
@@ -641,39 +646,243 @@ _BINOPS = {
 _UNARY = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 
 
-def _eval_node(node):
-    """只放行数字和算术运算，绝不 eval。"""
+class CalcError(ValueError):
+    """calc 的报错必须能照着改。
+
+    之前直接把 Python 原文抛回去（"invalid decimal literal"），模型看不懂，
+    于是换个写法再试、试到轮次用完，最后放弃 calc 改心算——2026-10-27 那次
+    解错题就是这么来的。现在报错一律带「下一步怎么写」。
+    """
+
+
+# 模型手写式子时最爱用的排版字符。实测 U+2212 减号、×、÷ 都出现过。
+_CALC_SUBS = {
+    "−": "-", "–": "-", "—": "-", "－": "-",
+    "×": "*", "·": "*", "⋅": "*", "＊": "*", "✕": "*", "✖": "*",
+    "÷": "/", "／": "/", "＋": "+", "＝": "=",
+    "（": "(", "）": ")", "，": ",", "、": ",", "；": ";",
+    "％": "%", "　": " ",
+}
+_LATEX_SUBS = [
+    (re.compile(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}"), r"((\1)/(\2))"),
+    (re.compile(r"\\sqrt\s*\{([^{}]*)\}"), r"sqrt(\1)"),
+    (re.compile(r"\\(?:times|cdot)\b"), "*"),
+    (re.compile(r"\\div\b"), "/"),
+    (re.compile(r"\\(?:left|right|,|;|!)"), ""),
+]
+
+
+def _norm_expr(text: str) -> str:
+    """把模型那套写法掰成 Python 算术：× → *，^ → **，3x → 3*x。"""
+    expr = text
+    for name, sub in _LATEX_SUBS:
+        expr = name.sub(sub, expr)
+    expr = "".join(_CALC_SUBS.get(ch, ch) for ch in expr)
+    expr = expr.replace("^", "**").replace("==", "=")
+    # 数字后面紧跟函数名（2sqrt(3)）先补一个乘号，别让下面那条规则把它拆坏
+    funcs = "|".join(sorted(_CALC_FUNCS, key=len, reverse=True))
+    expr = re.sub(rf"(?<=[\d)])(?=(?:{funcs})\s*\()", "*", expr)
+    # 隐式乘法：3x → 3*x，2(3+1) → 2*(3+1)
+    expr = re.sub(r"(?<=[\d)])(?=[a-zA-Z(])", "*", expr)
+    return expr.replace(" ", "")
+
+
+def _letters(expr: str) -> set[str]:
+    """式子里出现的自由未知数（函数名不算）。"""
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return set(re.findall(r"[a-zA-Z]", expr)) - set(_CALC_FUNCS)
+    # 先把被调用的函数名摘掉，再收剩下的 Name。
+    # 不能边 walk 边减：walk 是 BFS，Call 先于它的 func 子节点出现，
+    # 减完又被子节点加回去了（min(1,9) 会认成含未知数 min）。
+    funcs = {n.func.id for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    return names - funcs - set(_CALC_FUNCS)
+
+
+def _parse_expr(expr: str):
+    try:
+        return ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise CalcError(
+            f"看不懂「{expr}」。calc 只吃纯数字的算式：乘号写 *（不要写 ×，"
+            f"3x 要写 3*x），减号写 -（不要写 −），乘方写 **。"
+            f"带未知数的可以直接写成等式，比如 (1-x)/(1+x)=2/11，我来解。") from exc
+
+
+def _eval_node(node, env=None):
+    """只放行数字和算术运算，绝不 eval。env 给未知数赋值。"""
     if isinstance(node, ast.Expression):
-        return _eval_node(node.body)
+        return _eval_node(node.body, env)
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
+    if isinstance(node, ast.Name):
+        if env and node.id in env:
+            return env[node.id]
+        raise CalcError(f"不认识字母 {node.id}：要么把它的数值代进来，"
+                        f"要么把它写成等式（如 3*x+2=11）让我解")
     if isinstance(node, ast.BinOp):
         fn = _BINOPS.get(type(node.op))
         if fn is None:
-            raise ValueError("不支持这个运算符")
-        left, right = _eval_node(node.left), _eval_node(node.right)
+            raise CalcError("不支持这个运算符")
+        left, right = _eval_node(node.left, env), _eval_node(node.right, env)
         if isinstance(node.op, ast.Pow) and abs(right) > 64:
-            raise ValueError("指数太大了")
+            raise CalcError("指数太大了")
         return fn(left, right)
     if isinstance(node, ast.List) or isinstance(node, ast.Tuple):
-        return [_eval_node(e) for e in node.elts]
+        return [_eval_node(e, env) for e in node.elts]
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         fn = _CALC_FUNCS.get(node.func.id)
         if fn is None:
-            raise ValueError(f"calc 里没有 {node.func.id}()，只有 "
-                             "min/max/abs/round/floor/ceil/sqrt/int")
+            raise CalcError(f"calc 里没有 {node.func.id}()，只有 "
+                            "min/max/abs/round/floor/ceil/sqrt/int")
         if node.keywords:
-            raise ValueError("不支持关键字参数")
-        args = [_eval_node(a) for a in node.args]
+            raise CalcError("不支持关键字参数")
+        args = [_eval_node(a, env) for a in node.args]
         if len(args) > 8:
-            raise ValueError("参数太多了")
+            raise CalcError("参数太多了")
         return fn(*args)
     if isinstance(node, ast.UnaryOp):
         fn = _UNARY.get(type(node.op))
         if fn is None:
-            raise ValueError("不支持这个运算符")
-        return fn(_eval_node(node.operand))
-    raise ValueError("表达式里只能有数字、+ - * / // % **，以及 min/max/abs/round/floor/ceil/sqrt")
+            raise CalcError("不支持这个运算符")
+        return fn(_eval_node(node.operand, env))
+    raise CalcError("表达式里只能有数字、+ - * / // % **，"
+                    "以及 min/max/abs/round/floor/ceil/sqrt")
+
+
+def _num(v: float) -> str:
+    if isinstance(v, int) or (isinstance(v, float) and v.is_integer()):
+        return str(int(v))
+    return f"{round(v, 10):g}"
+
+
+def _bisect(fn, lo: float, hi: float, flo: float) -> float | None:
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        fmid = fn(mid)
+        if fmid is None:
+            return None          # 中点落在分母零点上，不追了
+        if fmid == 0:
+            return mid
+        if (flo < 0) != (fmid < 0):
+            hi = mid
+        else:
+            lo, flo = mid, fmid
+        if hi - lo < 1e-13:
+            break
+    return (lo + hi) / 2
+
+
+def _solve_text(expr: str) -> str:
+    """一元等式：数值找根，然后把解代回两边各算一次给验算。
+
+    模型解方程最容易错在变形那一步（2026-10-27：把 (1-x)/(1+x)=… 化成了
+    1-x=2，解出 x=-1）。它把整个等式丢进来就不会有变形这一步。
+    """
+    if expr.count("=") != 1:
+        raise CalcError("一次只能解一个等式。两个等号的话分两次算。")
+    lhs_s, rhs_s = expr.split("=")
+    if not lhs_s or not rhs_s:
+        raise CalcError(f"等式不完整：「{expr}」，两边都要有式子")
+    names = _letters(lhs_s) | _letters(rhs_s)
+    lhs_tree, rhs_tree = _parse_expr(lhs_s), _parse_expr(rhs_s)
+    if not names:
+        left = _eval_node(lhs_tree)
+        right = _eval_node(rhs_tree)
+        same = abs(left - right) < 1e-9
+        return (f"{lhs_s} = {_num(left)}，{rhs_s} = {_num(right)}，"
+                f"{'相等' if same else '不相等'}")
+    if len(names) > 1:
+        raise CalcError(
+            f"式子里有 {len(names)} 个未知数（{'、'.join(sorted(names))}），"
+            f"calc 一次只解一个。先把已知的数值代进去，只留一个未知数")
+    var = names.pop()
+
+    errs: list[Exception] = []
+
+    def f(x):
+        env = {var: x}
+        try:
+            return _eval_node(lhs_tree, env) - _eval_node(rhs_tree, env)
+        except CalcError as exc:
+            # 用了不认识的函数（log、exp…）之类：记下来，别装作「无解」
+            errs.append(exc)
+            return None
+        except (ZeroDivisionError, ValueError):
+            # 分母零点、sqrt 负数：这一段没定义，跳过
+            return None
+
+    lo, hi, steps = -200.0, 200.0, 40000
+    # 先看看是不是恒等式（x=x、2*(x+1)=2x+2）。不然下面会把整条区间都当成根，
+    # 一次吐四万个解出来。
+    probes = [lo + (hi - lo) * k / 8 for k in range(9)]
+    vals = [f(x) for x in probes]
+    if all(v is not None and abs(v) < 1e-9 for v in vals):
+        return (f"{expr}：两边恒等，任何 {var} 都成立。"
+                f"要算具体数值就把它换成数字再算。")
+
+    step = (hi - lo) / steps
+    roots: list[float] = []
+    prev_x, prev_y = lo, f(lo)
+    if prev_y is not None and abs(prev_y) < 1e-12:
+        roots.append(lo)
+    for i in range(1, steps + 1):
+        x = lo + i * step
+        y = f(x)
+        if y is None or prev_y is None:
+            prev_x, prev_y = x, y
+            continue
+        if y == 0:
+            roots.append(x)
+        elif (prev_y < 0) != (y < 0):
+            r = _bisect(f, prev_x, x, prev_y)
+            if r is not None:
+                roots.append(r)
+        prev_x, prev_y = x, y
+
+    # 变号也可能是跨过分母零点（1/x 那种），代回去残差大的不是根
+    roots = [r for r in roots if (fv := f(r)) is not None and abs(fv) < 1e-6]
+    roots.sort()
+    merged: list[float] = []
+    for r in roots:
+        if not merged or abs(r - merged[-1]) > 1e-6:
+            merged.append(r)
+
+    if not merged:
+        if errs:
+            raise errs[0]
+        return (f"{expr}：在 -200~200 里没找到解。可能解在区间外，"
+                f"或者式子抄错了（看看符号和分母）。")
+
+    parts = []
+    for r in merged[:6]:
+        try:
+            frac = Fraction(r).limit_denominator(1000)
+        except (ValueError, OverflowError):
+            frac = None
+        if frac is not None and frac.denominator != 1 and abs(float(frac) - r) < 1e-9:
+            parts.append(f"{var} = {frac.numerator}/{frac.denominator} ≈ {_num(r)}")
+        else:
+            parts.append(f"{var} = {_num(r)}")
+    head = f"{lhs_s} = {rhs_s} → " + "；".join(parts)
+    if len(merged) > 6:
+        head += f"（一共 {len(merged)} 个解，只列前 6 个）"
+
+    checks = []
+    for r in merged[:2]:
+        env = {var: r}
+        try:
+            left = _eval_node(_parse_expr(lhs_s), env)
+            right = _eval_node(_parse_expr(rhs_s), env)
+            diff = abs(left - right)
+            checks.append(f"代回 {var}={_num(r)}：左 {_num(left)}，右 {_num(right)}，"
+                          f"差 {diff:.1e}")
+        except (ZeroDivisionError, CalcError):
+            checks.append(f"代回 {var}={_num(r)} 时分母为 0，这个根要单独说明")
+    return head + "\n验算：" + "；".join(checks)
 
 
 def tool_get_time() -> str:
@@ -703,15 +912,23 @@ def tool_roll(args: dict) -> str:
 
 
 def tool_calc(args: dict) -> str:
-    expr = str(args.get("expression") or "").strip()
-    if not expr:
-        raise ValueError("算式是空的")
-    if len(expr) > 200:
-        raise ValueError("算式太长了")
-    value = _eval_node(ast.parse(expr, mode="eval"))
+    raw = str(args.get("expression") or "").strip()
+    if not raw:
+        raise CalcError("算式是空的")
+    if len(raw) > 200:
+        raise CalcError("算式太长了，拆成几步算")
+    expr = _norm_expr(raw)
+    if "=" in expr:
+        return _solve_text(expr)
+    try:
+        value = _eval_node(_parse_expr(expr))
+    except ZeroDivisionError as exc:
+        raise CalcError(f"{raw} 除以 0 了，检查分母") from exc
+    if isinstance(value, list):
+        return f"{raw} = {value}"
+    if isinstance(value, float) and value.is_integer():
+        return f"{expr} = {int(value)}"
     if isinstance(value, float):
-        if value.is_integer():
-            return f"{expr} = {int(value)}"
         return f"{expr} = {round(value, 10):g}"
     return f"{expr} = {value}"
 
@@ -876,7 +1093,8 @@ async def run_tool(name: str, args: dict, ctx: dict) -> str:
             return await tool_video_info(args, ctx)
         return f"没有叫 {name} 的工具"
     except Exception as exc:
-        log.warning("工具 %s 出错：%s", name, exc)
+        # 带上入参：只有错误类型时根本没法查是哪一步算错的
+        log.warning("工具 %s 出错：%s ｜ 入参=%r", name, exc, args)
         return f"工具出错了：{exc}"
 
 
@@ -1133,11 +1351,17 @@ SOLVE_RULES = (
     "{ocr}\n\n"
     "【规矩】\n"
     "1. 分步写。算术必须用 calc，别心算：算上界、算利润、比大小都调它。\n"
-    "2. 求整数最优（件数、人数、个数）时，先算每个变量的上界，再按一个变量从 0 扫到上界："
+    "2. 带未知数的等式直接交给 calc 解，比如 (1-x)/(1+x)=2/11 或 3*x+2=11，"
+    "它会把解算出来、再把解代回两边验一遍。别自己移项——上次就是在移项那步把 "
+    "(1-x)/(1+x)=… 写成了 1-x=2，整道题都错了。式子里只能留一个未知数，"
+    "别的字母先用题里给的数代掉。写法用 ASCII：乘号 *，减号 -，乘方 **。\n"
+    "3. 求整数最优（件数、人数、个数）时，先算每个变量的上界，再按一个变量从 0 扫到上界："
     "每个 x 都用 calc 算出满足所有约束的最大整数 y，算这组的结果，一行一行列出来，取最大那行。"
     "只代顶点、跳着挑点、或者凭感觉估，都会漏掉真正的最优。\n"
-    "3. 算完回头验一遍：把答案代回每一条约束看有没有超，再确认没有第二组同样好。\n"
-    "4. 最后单独一行写「答案：……」，选择题写清选哪个。400 字以内。看不清的字就说看不清。")
+    "4. 算完回头验一遍：把答案代回每一条约束看有没有超，再确认没有第二组同样好。"
+    "算出来的数看着不顺手（负数、大得离谱、跟选项对不上）就是前面弄错了，回头重算，别硬发。\n"
+    "5. 别在回答里提「calc」「工具」「算不了」「丢进去」这些，也别提图——直接给解法。\n"
+    "6. 最后单独一行写「答案：……」，选择题写清选哪个。400 字以内。看不清的字就说看不清。")
 
 # 下载图片必须显式禁用代理。urllib 默认会读 HTTP_PROXY / 系统代理，
 # 把访问 127.0.0.1 的 NapCat 图片请求塞进 Clash，直接连不上。
@@ -1233,6 +1457,37 @@ async def ocr_image(images: list[bytes]) -> str:
     except Exception as exc:
         log.warning("OCR 失败：%s", exc)
         return ""
+
+
+SOLVE_LOG = LOG_DIR / "solve.jsonl"
+SOLVE_DIR = LOG_DIR / "solve"
+SOLVE_KEEP = 60
+
+
+def _note_solve(q: str, ocr: str, answer: str, images: list[bytes]) -> None:
+    """留档：题目图 + OCR 文本 + 最终回答。
+
+    原来日志只截前 40 字，复盘「她答错了」时连题目都还原不出来。
+    现在图和全文都落在 logs/solve/，可以直接把同一张图再跑一遍。
+    """
+    try:
+        SOLVE_DIR.mkdir(exist_ok=True)
+        ts = int(time.time())
+        ext = {b"image/png": ".png", b"image/gif": ".gif",
+               b"image/webp": ".webp", b"image/bmp": ".bmp"}
+        names = []
+        for i, b in enumerate(images):
+            name = f"{ts}_{i}{ext.get(_sniff_mime(b) or '', '.jpg')}"
+            (SOLVE_DIR / name).write_bytes(b)
+            names.append(name)
+        with SOLVE_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": ts, "q": q, "ocr": ocr, "a": answer,
+                                "img": names}, ensure_ascii=False) + "\n")
+        old = sorted(SOLVE_DIR.glob("*"))[:-SOLVE_KEEP]
+        for p in old:
+            p.unlink(missing_ok=True)
+    except OSError as exc:
+        log.debug("解题存档失败：%s", exc)
 
 
 async def collect_images(ws, evt: dict) -> list[bytes]:
@@ -2421,6 +2676,7 @@ async def handle(ws, evt: dict) -> None:
         reset_chime(evt.get("group_id"))   # 她刚说过话，插话计时重新开始
 
     images = await collect_images(ws, evt) if has_image else []
+    picked_images = images   # 解题存档要用原图，下面 images 会被清空
 
     extra_parts = []
     if bg:
@@ -2464,6 +2720,7 @@ async def handle(ws, evt: dict) -> None:
     prompt = text or "（对方只发了一张图，一个字都没写）"
     rounds = 4
     solve_model = None
+    solve_ocr = ""
     if images:
         if VISION_TASK_RE.search(text):
             ocr = await ocr_image(images)
@@ -2472,6 +2729,7 @@ async def handle(ws, evt: dict) -> None:
                 extra = (extra + "\n\n" if extra else "") + SOLVE_RULES.format(ocr=ocr)
                 log.info("看图当解题：%r，OCR %d 字，转文本模型分步解",
                          (text or "")[:24], len(ocr))
+                solve_ocr = ocr
                 images = []
                 rounds = 10         # 分步解题要来回调 calc，4 轮不够
                 solve_model = ((cfg().get("vision") or {}).get("solve_model")
@@ -2488,7 +2746,11 @@ async def handle(ws, evt: dict) -> None:
             answer = await ask(key, prompt, {
                 "ws": ws, "evt": evt, "group_id": evt.get("group_id"),
             }, extra=extra, images=images, rounds=rounds, model=solve_model)
-            log.info("[%s] Q=%r A=%r", key, prompt[:40], answer[:40])
+            if solve_ocr:
+                log.info("[%s] 解题：Q=%r A=%r", key, prompt[:40], answer[:120])
+                _note_solve(prompt, solve_ocr, answer, picked_images)
+            else:
+                log.info("[%s] Q=%r A=%r", key, prompt[:40], answer[:40])
         except asyncio.TimeoutError:
             answer = "模型响应超时，稍后再试。"
         except Exception as exc:
