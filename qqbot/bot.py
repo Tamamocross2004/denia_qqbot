@@ -8,6 +8,7 @@ import ast
 import base64
 import json
 import logging
+import math
 import operator
 import os
 import random
@@ -290,11 +291,14 @@ async def _chat_loop(msgs: list[dict], params: dict, ctx: dict,
                      rounds: int = 4) -> tuple[str, set[str]]:
     """跑工具调用循环，返回 (最终回答, 这次用过哪些工具)。"""
     used: set[str] = set()
+    last_text = ""
     for _ in range(rounds):
         resp = await asyncio.wait_for(
             client.chat.completions.create(messages=msgs, **params), timeout=90
         )
         msg = resp.choices[0].message
+        if msg.content:
+            last_text = msg.content.strip()
         if not msg.tool_calls:
             return (msg.content or "").strip(), used
         used.update(t.function.name for t in msg.tool_calls)
@@ -311,6 +315,10 @@ async def _chat_loop(msgs: list[dict], params: dict, ctx: dict,
                 targs = {}
             result = await run_tool(tc.function.name, targs, ctx)
             msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+    # 轮次用完：把中途写出来的那部分给她，总比一句「绕不出来」强
+    if last_text:
+        log.warning("工具轮次用完了（%d 轮），用最后一段文字收尾", rounds)
+        return last_text, used
     return "……绕不出来了，你换个说法再问一遍。", used
 
 
@@ -352,7 +360,8 @@ EXPAND_HINT = (
 
 
 async def ask(key: str, prompt: str, ctx: dict | None = None,
-              extra: str = "", images: list[bytes] | None = None) -> str:
+              extra: str = "", images: list[bytes] | None = None,
+              rounds: int = 4, model: str | None = None) -> str:
     c = cfg()
     max_turns = int(c.get("max_history_turns", 10))
     hist = history.setdefault(key, [])
@@ -385,7 +394,7 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
         msgs[-1] = {"role": "user", "content": body}
 
     params = {
-        "model": c.get("model", "deepseek-flash"),
+        "model": model or c.get("model", "deepseek-flash"),
         "max_tokens": int(c.get("max_output_tokens", 1024)),
     }
     if bool(c.get("thinking", False)):
@@ -399,6 +408,8 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
         # 视觉模型不一定支持 function calling，带图那次干脆不给工具
         params["model"] = ((c.get("vision") or {}).get("model")
                            or VISION_FALLBACK)
+        # 解题那次要写步骤，1024 token 不够 400 字
+        params["max_tokens"] = max(int(params["max_tokens"]), 1400)
     elif (c.get("tools") or {}).get("enable", True):
         specs = TOOLS_SPEC
         if (c.get("schedule") or {}).get("enable", True):
@@ -406,7 +417,7 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
             specs = [t for t in specs if t["function"]["name"] != "get_time"]
         params["tools"] = specs
 
-    answer, used = await _chat_loop(msgs, params, ctx or {}, 4)
+    answer, used = await _chat_loop(msgs, params, ctx or {}, rounds)
 
     # 她说「不知道」但其实一次都没查——逼她补一轮搜索再重新回答。
     # 这是针对「群友说个听不懂的词，她直接敷衍过去」最直接的修法：
@@ -615,6 +626,13 @@ TOOLS_SPEC = [
     },
 ]
 
+# calc 里允许调用的函数。实测解题时模型会写 min(12-3x, (10-x)/2)、floor(...)，
+# 只放行 + - * / 的话它会被怼回去、然后连着重试十几次，最后干脆心算。
+_CALC_FUNCS = {
+    "min": min, "max": max, "abs": abs, "round": round,
+    "floor": math.floor, "ceil": math.ceil, "sqrt": math.sqrt, "int": int,
+}
+
 _BINOPS = {
     ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
     ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
@@ -637,12 +655,25 @@ def _eval_node(node):
         if isinstance(node.op, ast.Pow) and abs(right) > 64:
             raise ValueError("指数太大了")
         return fn(left, right)
+    if isinstance(node, ast.List) or isinstance(node, ast.Tuple):
+        return [_eval_node(e) for e in node.elts]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        fn = _CALC_FUNCS.get(node.func.id)
+        if fn is None:
+            raise ValueError(f"calc 里没有 {node.func.id}()，只有 "
+                             "min/max/abs/round/floor/ceil/sqrt/int")
+        if node.keywords:
+            raise ValueError("不支持关键字参数")
+        args = [_eval_node(a) for a in node.args]
+        if len(args) > 8:
+            raise ValueError("参数太多了")
+        return fn(*args)
     if isinstance(node, ast.UnaryOp):
         fn = _UNARY.get(type(node.op))
         if fn is None:
             raise ValueError("不支持这个运算符")
         return fn(_eval_node(node.operand))
-    raise ValueError("表达式里只能有数字和 + - * / // % **")
+    raise ValueError("表达式里只能有数字、+ - * / // % **，以及 min/max/abs/round/floor/ceil/sqrt")
 
 
 def tool_get_time() -> str:
@@ -1068,6 +1099,46 @@ async def reply_with_media(ws, evt: dict, text: str,
 IMG_MAX_BYTES = 6 * 1024 * 1024
 VISION_FALLBACK = "deepseek-v4-flash-vision-exp"
 
+# 看图分两种：随手拍（随口吐槽）和「要解决的东西」（读题、分步、给答案）。
+# 实测差别很大：同一张线性规划题，闲聊版答 x=2,y=4 利润 2000（错），
+# 解题版会去枚举整数点、发现 (3,3) 才是 2100（对）。
+VISION_CASUAL = (
+    "【图就在这条消息里】直接说你看到了什么、什么反应，"
+    "别用「这张图片显示」「图中是一位」这种识图腔，像个真人瞄了一眼随口吐个槽。"
+    "图太糊或看不出重点就直说看不清，别硬编细节。")
+VISION_SOLVE = (
+    "【图里是题目/试卷/代码报错这类要被解决的东西，按这个来】\n"
+    "① 先把题目条件读出来：数字、公式、区间、选项，一个都别漏；"
+    "公式用普通符号打（a² 写成 a^2，根号写 sqrt）。\n"
+    "② 一步一步算，关键的中间结果写出来。涉及最值、取整、边界的，"
+    "算完回头验一遍再下结论——别拿一个看起来顺眼的点就当答案。\n"
+    "③ 最后单独一行给答案，选择题写清选哪个。\n"
+    "这条不用管平时那个 100 字限制，可以写到 400 字。别用「这张图片显示」这种腔调。"
+    "看不清的字直接说「这个字看不清」，别猜着编数。")
+# 这些说法基本就是在让帮忙做题/看报错，而不是让你评价一张照片
+VISION_TASK_RE = re.compile(
+    r"(怎么做|怎么解|求解|解答|答案|算一下|算算|求一下|求出|证明|化简|推导"
+    r"|选哪个|选什么|哪一项|哪个对|错在哪|为什么错|怎么修|报错|什么错"
+    r"|翻译一下|翻译下|解释一下这|帮我做|帮我看看这|这题|这道题|这几题|试试这)")
+
+# 解题走两段：先让视觉模型只做 OCR，再让文本模型带 calc 分步解。
+# 一段做为什么不够：视觉模型抄得对，但算数会飘（同一道线性规划题，三次给出
+# 2000 / 1840 / 2100 三个答案）。文本模型有 calc，算术是准的。
+VISION_OCR_SYSTEM = (
+    "你是 OCR 工具。只把图里的文字逐字抄下来：保留换行、题号、选项、公式；"
+    "公式用普通符号（a² 写 a^2，根号写 sqrt）。不解答、不总结、不评论。"
+    "看不清的字用 □ 代替，别猜。")
+SOLVE_RULES = (
+    "【图已经抄成文字了，按下面的题面回答，别再说「图里」「这张图」】\n"
+    "{ocr}\n\n"
+    "【规矩】\n"
+    "1. 分步写。算术必须用 calc，别心算：算上界、算利润、比大小都调它。\n"
+    "2. 求整数最优（件数、人数、个数）时，先算每个变量的上界，再按一个变量从 0 扫到上界："
+    "每个 x 都用 calc 算出满足所有约束的最大整数 y，算这组的结果，一行一行列出来，取最大那行。"
+    "只代顶点、跳着挑点、或者凭感觉估，都会漏掉真正的最优。\n"
+    "3. 算完回头验一遍：把答案代回每一条约束看有没有超，再确认没有第二组同样好。\n"
+    "4. 最后单独一行写「答案：……」，选择题写清选哪个。400 字以内。看不清的字就说看不清。")
+
 # 下载图片必须显式禁用代理。urllib 默认会读 HTTP_PROXY / 系统代理，
 # 把访问 127.0.0.1 的 NapCat 图片请求塞进 Clash，直接连不上。
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -1136,6 +1207,32 @@ async def image_to_bytes(ws, seg: dict) -> bytes | None:
         except Exception as exc:
             log.debug("get_image 失败：%s", exc)
     return None
+
+
+async def ocr_image(images: list[bytes]) -> str:
+    """只做 OCR：把图里的文字抄成文本，不做任何解答。"""
+    if not images:
+        return ""
+    c = cfg()
+    model = ((c.get("vision") or {}).get("model")) or VISION_FALLBACK
+    parts: list[dict] = [{"type": "text", "text": "把图里的文字抄下来"}]
+    for b in images:
+        mime = _sniff_mime(b) or "image/jpeg"
+        parts.append({"type": "image_url", "image_url": {
+            "url": f"data:{mime};base64,{base64.b64encode(b).decode()}"}})
+    try:
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": VISION_OCR_SYSTEM},
+                          {"role": "user", "content": parts}],
+                max_tokens=1200, temperature=0,
+                extra_body={"thinking": {"type": "disabled"}}),
+            timeout=60)
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as exc:
+        log.warning("OCR 失败：%s", exc)
+        return ""
 
 
 async def collect_images(ws, evt: dict) -> list[bytes]:
@@ -2365,18 +2462,32 @@ async def handle(ws, evt: dict) -> None:
     extra = "\n\n".join(extra_parts)
 
     prompt = text or "（对方只发了一张图，一个字都没写）"
+    rounds = 4
+    solve_model = None
     if images:
-        extra = (extra + "\n\n" if extra else "") + (
-            "【图就在这条消息里】直接说你看到了什么、什么反应，"
-            "别用「这张图片显示」「图中是一位」这种识图腔，像个真人瞄了一眼随口吐个槽。"
-            "图太糊或看不出重点就直说看不清，别硬编细节。")
+        if VISION_TASK_RE.search(text):
+            ocr = await ocr_image(images)
+            if ocr:
+                # 图已经变成文字了，就别再把它发给文本模型
+                extra = (extra + "\n\n" if extra else "") + SOLVE_RULES.format(ocr=ocr)
+                log.info("看图当解题：%r，OCR %d 字，转文本模型分步解",
+                         (text or "")[:24], len(ocr))
+                images = []
+                rounds = 10         # 分步解题要来回调 calc，4 轮不够
+                solve_model = ((cfg().get("vision") or {}).get("solve_model")
+                               or "deepseek-v4-pro")
+            else:
+                extra = (extra + "\n\n" if extra else "") + VISION_SOLVE
+                log.info("OCR 没抄出东西，退回单次看图解题")
+        else:
+            extra = (extra + "\n\n" if extra else "") + VISION_CASUAL
 
     lock = locks.setdefault(key, asyncio.Lock())
     async with lock:
         try:
             answer = await ask(key, prompt, {
                 "ws": ws, "evt": evt, "group_id": evt.get("group_id"),
-            }, extra=extra, images=images)
+            }, extra=extra, images=images, rounds=rounds, model=solve_model)
             log.info("[%s] Q=%r A=%r", key, prompt[:40], answer[:40])
         except asyncio.TimeoutError:
             answer = "模型响应超时，稍后再试。"
