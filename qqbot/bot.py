@@ -358,7 +358,7 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
     hist = history.setdefault(key, [])
 
     # 历史里只留文字版：多模态 content 带着 base64 滚进后续每一轮，token 会炸
-    stored = prompt if not images else f"{prompt}\n（还发了一张图）"
+    stored = prompt if not images else f"{prompt}\n（还发了 {len(images)} 张图）"
     hist.append({"role": "user", "content": stored})
 
     system = c.get("system_prompt", "")
@@ -1694,8 +1694,20 @@ async def video_answer(ws, evt: dict, link: dict, question: str) -> None:
                 log.warning("视频转写超时：%s", info.get("id"))
             except Exception as exc:
                 log.warning("视频转写失败：%s", exc)
-        log.info("[video %s] 《%s》转写 %d 字",
-                 info.get("id"), (info.get("title") or "")[:28], len(transcript))
+        # 画面：B站自带的视频快照（一张雪碧图），裁几帧给视觉模型，不下载视频
+        shots: list[bytes] = []
+        want_shots = int(vc.get("frames", 4) or 0)
+        if want_shots > 0:
+            try:
+                shots = await asyncio.wait_for(
+                    asyncio.to_thread(video.frames, info, want_shots,
+                                      int(vc.get("frame_width", 640))),
+                    timeout=25)
+            except Exception as exc:
+                log.warning("取视频画面失败：%s", exc)
+        log.info("[video %s] 《%s》转写 %d 字，画面 %d 帧",
+                 info.get("id"), (info.get("title") or "")[:28],
+                 len(transcript), len(shots))
 
         body = video.describe(info, transcript)
         extra = (
@@ -1705,10 +1717,14 @@ async def video_answer(ws, evt: dict, link: dict, question: str) -> None:
             "可以吐槽 UP 主、标题和热评，也可以接一个内容里的具体细节。"
             "不要复述、不要逐条总结、不要说「视频中提到」这种话。"
             "转写是机器识别的，专有名词写错就别硬叫名字。】")
+        if shots:
+            extra += (f"\n\n【后面 {len(shots)} 张图是这个视频的画面截图（按时间顺序）。"
+                      "能看出在拍什么就用它说事，比如画面和标题对不上的地方；"
+                      "看不清就只当没看过这几张，别硬描述。】")
         ask_q = (question or "").strip() or "（他什么都没说，就甩了个链接过来）"
         answer = await ask(key, ask_q,
                            {"ws": ws, "evt": evt, "group_id": evt.get("group_id")},
-                           extra=extra)
+                           extra=extra, images=shots or None)
         log.info("[video %s] Q=%r A=%r", info.get("id"), ask_q[:30], answer[:40])
         video.mark_done(evt.get("group_id"), info.get("id") or tag)
         await reply_with_media(ws, evt, answer, quote=True)

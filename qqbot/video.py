@@ -56,6 +56,8 @@ _OPEN = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 LINKS_RE = re.compile(r"https?://[^\s，。！？；：、）】」》\"'<>()\[\]]+")
 BVID_RE = re.compile(r"(BV[0-9A-Za-z]{10})")
+# 手机分享卡片的 title 常常只是 app 名，不是视频标题
+APP_NAMES = {"哔哩哔哩", "bilibili", "哔哩哔哩弹幕网", "QQ", "微信"}
 AVID_RE = re.compile(r"(?:^|/)av(\d+)", re.I)
 SHORT_HOSTS = ("b23.tv", "bili2233.cn", "bili22.cn", "v.douyin.com", "xhslink.com")
 
@@ -79,10 +81,23 @@ def _clean_url(u: str) -> str:
 
 
 def _urls_in(raw: str) -> list[str]:
+    """把字符串里的 http(s) 链接都挖出来。
+
+    小程序卡片经常把目标链接塞进 mqqapi:// 的查询参数里、还是 URL 编码过的
+    （...%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV...），所以解一次码再找一遍。
+    """
     if not raw:
         return []
     text = raw.replace("&amp;", "&").replace("\\/", "/")
-    return [_clean_url(u) for u in LINKS_RE.findall(text)]
+    found = [_clean_url(u) for u in LINKS_RE.findall(text)]
+    if not found:
+        try:
+            decoded = urllib.parse.unquote(text)
+        except Exception:
+            decoded = text
+        if decoded != text:
+            found = [_clean_url(u) for u in LINKS_RE.findall(decoded)]
+    return found
 
 
 def _from_json_seg(raw: str) -> list[dict]:
@@ -101,7 +116,17 @@ def _from_json_seg(raw: str) -> list[dict]:
             continue
         url = (item.get("jumpUrl") or item.get("qqdocurl")
                or item.get("url") or "")
-        title = (item.get("title") or item.get("desc") or "").strip()
+        title = (item.get("title") or "").strip()
+        desc = (item.get("desc") or item.get("summary") or "").strip()
+        # 手机分享的卡片 title 往往是「哔哩哔哩」这种 app 名，真标题在 desc 里
+        if title in APP_NAMES and desc:
+            title = desc
+        if not url.startswith("http"):
+            # 小程序卡片：mqqapi://... 里可能嵌着编码过的目标链接
+            for u in _urls_in(str(item)):
+                if "bilibili.com" in u or video_id(u):
+                    url = u
+                    break
         if url.startswith("http"):
             out.append({"url": _clean_url(url), "title": title[:120]})
     if not out:
@@ -493,6 +518,85 @@ def transcribe(info: dict, asr: dict, max_seconds: int = 600) -> str:
         store.save_video(vid, info.get("title") or "", info.get("up") or "",
                          int(info.get("seconds") or 0), text)
     return text
+
+
+def _get_bytes(url: str, referer: str = "https://www.bilibili.com/",
+               timeout: float = 20.0, limit: int = 8 * 1024 * 1024) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": referer})
+    with _OPEN.open(req, timeout=timeout) as resp:
+        return resp.read(limit)
+
+
+def frames(info: dict, count: int = 4, width: int = 640) -> list[bytes]:
+    """从 B站自带的「视频快照」里裁几帧，**不下载视频本体**。
+
+    `x/player/videoshot` 给的是一张 10x10 的雪碧图，每格 480x270，
+    138 秒的视频有 26 格——足够看清在拍什么。纯色的格子（片头片尾黑屏）
+    会被跳掉，剩下的按时间均匀挑 count 张。
+    """
+    if not info or info.get("platform") != "bilibili" or not info.get("cid"):
+        return []
+    try:
+        data = _get_json("https://api.bilibili.com/x/player/videoshot"
+                         f"?bvid={info['id']}&cid={info['cid']}&index=1",
+                         referer=info.get("url") or "")
+    except Exception:
+        return []
+    if data.get("code") != 0:
+        return []
+    d = data.get("data") or {}
+    imgs = d.get("image") or []
+    if not imgs:
+        return []
+
+    xl = int(d.get("img_x_len") or 10)
+    yl = int(d.get("img_y_len") or 10)
+    try:
+        total = min(int(len(d.get("index") or [])), xl * yl)
+    except (TypeError, ValueError):
+        total = xl * yl
+    if total <= 0:
+        return []
+
+    url = str(imgs[0])
+    if url.startswith("//"):
+        url = "https:" + url
+    try:
+        raw = _get_bytes(url, info.get("url") or "")
+    except Exception:
+        return []
+
+    import io
+
+    from PIL import Image, ImageStat
+    try:
+        sheet = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:
+        return []
+
+    cw, ch = sheet.width / xl, sheet.height / yl
+    cells = []
+    for k in range(total):
+        col, row = k % xl, k // xl
+        cell = sheet.crop((col * cw, row * ch, (col + 1) * cw, (row + 1) * ch))
+        if sum(ImageStat.Stat(cell).stddev) / 3 < 8:
+            continue                      # 纯色/黑屏，没信息
+        cells.append(cell)
+    if not cells:
+        return []
+
+    if len(cells) > count:
+        step = len(cells) / count
+        cells = [cells[min(int(i * step), len(cells) - 1)] for i in range(count)]
+
+    out: list[bytes] = []
+    for cell in cells:
+        w = min(width, cell.width)
+        h = max(1, int(cell.height * w / cell.width))
+        buf = io.BytesIO()
+        cell.resize((w, h)).save(buf, format="JPEG", quality=80)
+        out.append(buf.getvalue())
+    return out
 
 
 async def fetch_async(url: str, title: str = "", direct: bool = False) -> dict:

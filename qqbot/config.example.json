@@ -107,6 +107,8 @@
     "link_ttl": 600,
     "max_seconds": 600,
     "timeout": 300,
+    "frames": 4,
+    "frame_width": 640,
     "cache_days": 7,
     "asr": {
       "enable": true,
