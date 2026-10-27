@@ -798,8 +798,7 @@ async def tool_video_info(args: dict, ctx: dict) -> str:
     if not info.get("title"):
         return "这个链接抓不到内容，可能不是视频，或者平台要登录。"
 
-    cached = store.get_video(info.get("id") or "") or {}
-    return video.describe(info, cached.get("transcript") or "")
+    return video.describe(info, video.cached(info))
 
 
 async def tool_web_search(args: dict, ctx: dict) -> str:
@@ -1712,11 +1711,14 @@ async def video_answer(ws, evt: dict, link: dict, question: str) -> None:
         body = video.describe(info, transcript)
         extra = (
             f"{body}\n\n"
-            "【这是群友刚发到群里的视频，你刚看完。用你自己的口气说两句："
-            "先给你的判断——值不值得看、哪里有问题、有没有标题党；"
-            "可以吐槽 UP 主、标题和热评，也可以接一个内容里的具体细节。"
-            "不要复述、不要逐条总结、不要说「视频中提到」这种话。"
-            "转写是机器识别的，专有名词写错就别硬叫名字。】")
+            "【这是群友刚发到群里的视频，你刚看完。用你自己的口气说两句，顺序是：\n"
+            "① 先用一句话说清这视频到底讲了什么——带上具体信息（模型名、价格、功能、"
+            "型号、数字这类），让人一听就知道你真看了；\n"
+            "② 再说你的判断：值不值得看、哪里在吹、有没有标题党。\n"
+            "标题里出现的名字是准确的，可以照用；转写里的同音错字别跟着抄，"
+            "拿不准就用「这模型」「这玩意儿」带过去。\n"
+            "可以吐槽 UP 主、标题和热评。别复述、别逐条总结、别说「视频中提到」。"
+            "这条可以稍长一点，两到三句、最多 200 字。】")
         if shots:
             extra += (f"\n\n【后面 {len(shots)} 张图是这个视频的画面截图（按时间顺序）。"
                       "能看出在拍什么就用它说事，比如画面和标题对不上的地方；"
@@ -1752,11 +1754,11 @@ async def maybe_pick_video(gid) -> str:
         return ""
     if not info.get("title"):
         return ""
-    cached = store.get_video(info.get("id") or "") or {}
+    cached_text = video.cached(info)
     VIDEO_PICK_LAST[gid] = now
     video.mark_done(gid, info.get("id") or pick.get("vid") or "")
     log.info("[chime %s] 捡到一个没人理的视频：%s", gid, (info.get("title") or "")[:30])
-    return video.describe(info, cached.get("transcript") or "")
+    return video.describe(info, cached_text)
 
 
 async def maybe_chime_in(ws, evt: dict) -> None:

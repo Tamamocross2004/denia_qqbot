@@ -474,24 +474,53 @@ def _whisper(asr: dict):
         return _model
 
 
-def _asr_file(wav: Path, asr: dict) -> str:
+def _asr_file(wav: Path, asr: dict, hint: str = "") -> str:
+    """转写。hint 一般是视频标题——把专有名词先喂给解码器当锚。
+
+    实测同一条 85 秒的视频：不带标题时「GPT-6.1 Terra」听成「GPT-6.1TB」，
+    带上标题就对了；「视频剪辑、辅助工程」也从「细兵剪机辅助」变回正确写法。
+    """
+    prompt = "以下是普通话的句子，用简体中文。"
+    hint = (hint or "").strip()
+    if hint:
+        # 太长反而会让模型照着提示词复读，只取前 40 字
+        prompt += f"视频标题：{hint[:40]}。"
     with _asr_lock:
         model = _whisper(asr)
         audio = _read_wav(wav)
         segs, _info = model.transcribe(
             audio, language="zh", vad_filter=True, beam_size=5,
-            initial_prompt="以下是普通话的句子，用简体中文。")
+            initial_prompt=prompt)
         return "".join(s.text for s in segs).strip()
+
+
+# 转写策略一改（提示词、模型），旧缓存就不该再用了：把它编进 key
+CACHE_VER = "v2"
+_TRANSCRIBE_VER_DOC = "v1 只有中文提示；v2 把标题喂进去当专有名词锚"
+
+
+def cache_key(info: dict) -> str:
+    vid = str(info.get("id") or "")
+    return f"{vid}@{CACHE_VER}" if vid else ""
+
+
+def cached(info: dict) -> str:
+    """只取缓存，不触发转写。"""
+    key = cache_key(info)
+    if not key:
+        return ""
+    row = store.get_video(key)
+    return (row or {}).get("transcript") or ""
 
 
 def transcribe(info: dict, asr: dict, max_seconds: int = 600) -> str:
     """同步转写（线程里跑）。同一个视频只跑一次，结果进库。"""
-    vid = str(info.get("id") or "")
+    vid = cache_key(info)
     if not vid:
         return ""
-    cached = store.get_video(vid)
-    if cached and cached.get("transcript"):
-        return cached["transcript"]
+    cached_row = store.get_video(vid)
+    if cached_row and cached_row.get("transcript"):
+        return cached_row["transcript"]
     direct = bool(info.get("direct"))
     if not direct and (not info.get("audio") or not info.get("cid")):
         return ""
@@ -510,7 +539,7 @@ def transcribe(info: dict, asr: dict, max_seconds: int = 600) -> str:
             return ""
         if not _to_wav(raw, wav, max_seconds):
             return ""
-        text = _asr_file(wav, asr)
+        text = _asr_file(wav, asr, info.get("title") or "")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -637,7 +666,7 @@ def describe(info: dict, transcript: str = "") -> str:
         body = transcript
         if len(body) > 1400:
             body = body[:1100] + "……（中间省略）……" + body[-250:]
-        lines.append("【音频转写（机器识别，专有名词可能有错，别当原文引用）】")
+        lines.append("【音频转写（机器识别：同音字会认错，但内容大意是准的，可以照着讲）】")
         lines.append(body)
     elif info.get("audio"):
         lines.append("【音频还没转写，只有标题和热评】")
