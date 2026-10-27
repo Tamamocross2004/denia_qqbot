@@ -31,10 +31,14 @@ async def main() -> None:
     print("--- 解题 ---")
 
     extra = bot.SOLVE_RULES.format(ocr=ocr)
-    model = ((bot.cfg().get("vision") or {}).get("solve_model")
-             or "deepseek-v4-pro")
-    answer = await bot.ask("probe", text, {"ws": None, "evt": {}, "group_id": None},
-                           extra=extra, images=[], rounds=10, model=model)
+    vc = bot.cfg().get("vision") or {}
+    answer = await bot.ask(
+        "probe", text, {"ws": None, "evt": {}, "group_id": None},
+        extra=extra, images=[], rounds=10,
+        model=vc.get("solve_model") or "deepseek-v4-pro",
+        system=vc.get("solve_system") or bot.VISION_SOLVE_SYSTEM,
+        temperature=float(vc.get("solve_temperature", 0)),
+        max_tokens=int(vc.get("solve_max_tokens", 2600)))
     print(answer)
     print("--- 存档 ---")
     bot._note_solve(text, ocr, answer, images)

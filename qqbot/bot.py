@@ -362,7 +362,9 @@ EXPAND_HINT = (
 
 async def ask(key: str, prompt: str, ctx: dict | None = None,
               extra: str = "", images: list[bytes] | None = None,
-              rounds: int = 4, model: str | None = None) -> str:
+              rounds: int = 4, model: str | None = None,
+              system: str | None = None, temperature: float | None = None,
+              max_tokens: int | None = None) -> str:
     c = cfg()
     max_turns = int(c.get("max_history_turns", 10))
     hist = history.setdefault(key, [])
@@ -371,7 +373,7 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
     stored = prompt if not images else f"{prompt}\n（还发了 {len(images)} 张图）"
     hist.append({"role": "user", "content": stored})
 
-    system = c.get("system_prompt", "")
+    system = system or c.get("system_prompt", "")
     if (c.get("schedule") or {}).get("enable", True):
         system = f"{system}\n\n{time_hint()}"
 
@@ -396,14 +398,15 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
 
     params = {
         "model": model or c.get("model", "deepseek-flash"),
-        "max_tokens": int(c.get("max_output_tokens", 1024)),
+        "max_tokens": int(max_tokens or c.get("max_output_tokens", 1024)),
     }
     if bool(c.get("thinking", False)):
         params["extra_body"] = {"thinking": {"type": "enabled"}}
     else:
         # V4 默认开思考，机器人场景必须显式关闭，否则慢且贵
         params["extra_body"] = {"thinking": {"type": "disabled"}}
-        params["temperature"] = float(c.get("temperature", 0.7))
+        params["temperature"] = float(temperature if temperature is not None
+                                      else c.get("temperature", 0.7))
 
     if images:
         # 视觉模型不一定支持 function calling，带图那次干脆不给工具
@@ -1343,25 +1346,52 @@ VISION_TASK_RE = re.compile(
 # 一段做为什么不够：视觉模型抄得对，但算数会飘（同一道线性规划题，三次给出
 # 2000 / 1840 / 2100 三个答案）。文本模型有 calc，算术是准的。
 VISION_OCR_SYSTEM = (
-    "你是 OCR 工具。只把图里的文字逐字抄下来：保留换行、题号、选项、公式；"
-    "公式用普通符号（a² 写 a^2，根号写 sqrt）。不解答、不总结、不评论。"
-    "看不清的字用 □ 代替，别猜。")
+    "你是 OCR 工具。只把图里的文字逐字抄下来：保留换行、题号、选项、公式。"
+    "所有公式用一行普通符号写，不许用 LaTeX（不要出现 $ \\frac \\times \\sqrt{}）。"
+    "上下结构的分数也写成 分子/分母：竖排的 3 在上、5 在下就写 3/5，"
+    "系数和字母之间空一格，写成 3/5 m。这种分数最容易读错，看清楚再写。"
+    "图里的示意图用一句话概括（谁在哪个位置、谁和谁怎么连），"
+    "点阵、×、边框这些装饰符号不用逐个抄。"
+    "看不清的字用 □ 代替，别猜。不解答、不总结、不评论。")
 SOLVE_RULES = (
     "【图已经抄成文字了，按下面的题面回答，别再说「图里」「这张图」】\n"
     "{ocr}\n\n"
     "【规矩】\n"
-    "1. 分步写。算术必须用 calc，别心算：算上界、算利润、比大小都调它。\n"
-    "2. 带未知数的等式直接交给 calc 解，比如 (1-x)/(1+x)=2/11 或 3*x+2=11，"
+    "1. 先把过程分段再算。物理题每段开头写一句「这段谁参与」——"
+    "碰撞、爆炸、绳子突然绷紧这种时间极短的过程，只有直接相撞的两个物体交换动量和能量，"
+    "弹簧、绳子另一头的物体来不及动，不算进来；碰完之后连接体再单独算一段。"
+    "（上次就是碰撞那一步把弹簧两头的球一起算进动量，第一问就错了。）\n"
+    "2. 算术必须用 calc，别心算：算上界、算利润、比大小都调它。"
+    "带未知数的等式直接交给它解，比如 (1-x)/(1+x)=2/11 或 3*x+2=11，"
     "它会把解算出来、再把解代回两边验一遍。别自己移项——上次就是在移项那步把 "
     "(1-x)/(1+x)=… 写成了 1-x=2，整道题都错了。式子里只能留一个未知数，"
     "别的字母先用题里给的数代掉。写法用 ASCII：乘号 *，减号 -，乘方 **。\n"
     "3. 求整数最优（件数、人数、个数）时，先算每个变量的上界，再按一个变量从 0 扫到上界："
     "每个 x 都用 calc 算出满足所有约束的最大整数 y，算这组的结果，一行一行列出来，取最大那行。"
     "只代顶点、跳着挑点、或者凭感觉估，都会漏掉真正的最优。\n"
-    "4. 算完回头验一遍：把答案代回每一条约束看有没有超，再确认没有第二组同样好。"
-    "算出来的数看着不顺手（负数、大得离谱、跟选项对不上）就是前面弄错了，回头重算，别硬发。\n"
-    "5. 别在回答里提「calc」「工具」「算不了」「丢进去」这些，也别提图——直接给解法。\n"
-    "6. 最后单独一行写「答案：……」，选择题写清选哪个。400 字以内。看不清的字就说看不清。")
+    "4. 答案本来就是字母的题（求比值、求表达式）也要给完：写成 v_A = 2M*v0/(M+m) 这种，"
+    "别因为算不出数就只写一半或干脆不答。比值题最后化简成最简分数。"
+    "纯字母的比值题算完必须代成数验一遍：比如算出 m/M=1/11，就设 m=1、M=11，"
+    "用 calc 把两边的量各算一遍，相等才算过；代不对就是前面错了。\n"
+    "5. 追及、会不会再撞，看的是**位置**，不是速度。弹簧这类系统里，形变归零的那一刻"
+    "各物体都回到相对质心的初始位置——三球对称的情形下就是三者重新重合在质心处。"
+    "所以「什么时候再撞」要比同一时刻的位移是否相等；"
+    "拿「两个速度相等」当临界条件会算出完全不同的答案（上次就错在这儿）。\n"
+    "6. 算完回头验一遍：把答案代回每一条约束看有没有超，再确认没有第二组同样好。"
+    "再做两个极端检查——M 远大于 m 时结果该退化成什么、两球质量相等时对不对；"
+    "数看着不顺手（负数、大得离谱、跟选项对不上）就是前面弄错了，回头重算，别硬发。\n"
+    "7. 有几问就答几问，一问都不能漏；三问的题可以写长一点，别为了省字跳步。"
+    "别在回答里提「calc」「工具」「算不了」「丢进去」这些，也别提图——直接给解法。"
+    "也别写「用 calc 验一下」这种话然后不验，要么真算，要么别说。\n"
+    "8. 最后单独一行写「答案：……」，把每问的结论列清楚。看不清的字就说看不清。")
+
+# 解题专用 system：人设还在，但那 4000 字聊天规矩会把答题带偏
+# （实测：带着人设答第16题，第一问就把弹簧两头的球算进动量守恒；
+# 换成「你是理科生，按段分析」这种短提示，同一题前两问直接对）。
+VISION_SOLVE_SYSTEM = (
+    "你是达妮娅，群里理科好的那个。现在有人在问作业，收起平时那套损话，"
+    "像个认真的学生把过程写清楚：先分段分析，再列式，最后算。"
+    "不用 Markdown 标题、不用 ** 加粗，公式用普通符号，能直接贴到群里看。")
 
 # 下载图片必须显式禁用代理。urllib 默认会读 HTTP_PROXY / 系统代理，
 # 把访问 127.0.0.1 的 NapCat 图片请求塞进 Clash，直接连不上。
@@ -1433,6 +1463,35 @@ async def image_to_bytes(ws, seg: dict) -> bytes | None:
     return None
 
 
+def _prep_ocr_image(data: bytes) -> bytes:
+    """OCR 前把图规整到视觉模型最认得的尺寸。
+
+    实测（2026-10-27 那张第16题手机截图）：1256×2760 时 `3/5` 被读成 `3/2`，
+    连跑 4 次错 4 次；缩到 900 宽和 760 宽各跑 2 次，全是 `3/5`。
+    同一个模型、同一张图，只差尺寸——细分数被读错一次，整道题就废了。
+
+    只压「手机截图」这一类（高宽比大），普通照片不动：照片普遍 3000px 起，
+    压到 900 会把小字压没。
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return data
+    import io
+    try:
+        im = Image.open(io.BytesIO(data))
+        w, h = im.size
+        if w <= 1000 or h / max(w, 1) < 1.8:
+            return data
+        im = im.convert("RGB").resize((900, int(h * 900 / w)), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=92)
+        return buf.getvalue()
+    except Exception as exc:      # 坏图、缺插件：原图照发，别让 OCR 整条挂掉
+        log.debug("OCR 预处理失败：%s", exc)
+        return data
+
+
 async def ocr_image(images: list[bytes]) -> str:
     """只做 OCR：把图里的文字抄成文本，不做任何解答。"""
     if not images:
@@ -1441,6 +1500,7 @@ async def ocr_image(images: list[bytes]) -> str:
     model = ((c.get("vision") or {}).get("model")) or VISION_FALLBACK
     parts: list[dict] = [{"type": "text", "text": "把图里的文字抄下来"}]
     for b in images:
+        b = _prep_ocr_image(b)
         mime = _sniff_mime(b) or "image/jpeg"
         parts.append({"type": "image_url", "image_url": {
             "url": f"data:{mime};base64,{base64.b64encode(b).decode()}"}})
@@ -2721,6 +2781,7 @@ async def handle(ws, evt: dict) -> None:
     rounds = 4
     solve_model = None
     solve_ocr = ""
+    solve_kw: dict = {}
     if images:
         if VISION_TASK_RE.search(text):
             ocr = await ocr_image(images)
@@ -2732,8 +2793,14 @@ async def handle(ws, evt: dict) -> None:
                 solve_ocr = ocr
                 images = []
                 rounds = 10         # 分步解题要来回调 calc，4 轮不够
-                solve_model = ((cfg().get("vision") or {}).get("solve_model")
-                               or "deepseek-v4-pro")
+                vc = cfg().get("vision") or {}
+                solve_model = vc.get("solve_model") or "deepseek-v4-pro"
+                # 解题单独一套参数：人设换短的、温度归零、字数给够
+                solve_kw = {
+                    "system": vc.get("solve_system") or VISION_SOLVE_SYSTEM,
+                    "temperature": float(vc.get("solve_temperature", 0)),
+                    "max_tokens": int(vc.get("solve_max_tokens", 2600)),
+                }
             else:
                 extra = (extra + "\n\n" if extra else "") + VISION_SOLVE
                 log.info("OCR 没抄出东西，退回单次看图解题")
@@ -2745,7 +2812,8 @@ async def handle(ws, evt: dict) -> None:
         try:
             answer = await ask(key, prompt, {
                 "ws": ws, "evt": evt, "group_id": evt.get("group_id"),
-            }, extra=extra, images=images, rounds=rounds, model=solve_model)
+            }, extra=extra, images=images, rounds=rounds, model=solve_model,
+                **solve_kw)
             if solve_ocr:
                 log.info("[%s] 解题：Q=%r A=%r", key, prompt[:40], answer[:120])
                 _note_solve(prompt, solve_ocr, answer, picked_images)

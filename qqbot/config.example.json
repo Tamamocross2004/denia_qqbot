@@ -12,7 +12,9 @@
     "enable": true,
     "model": "deepseek-v4-flash-vision-exp",
     "max_images": 2,
-    "solve_model": "deepseek-v4-pro"
+    "solve_model": "deepseek-v4-pro",
+    "solve_temperature": 0,
+    "solve_max_tokens": 2600
   },
   "tools": {
     "enable": true
