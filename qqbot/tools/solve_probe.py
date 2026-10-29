@@ -43,6 +43,11 @@ async def main() -> None:
     print("--- 存档 ---")
     bot._note_solve(text, ocr, answer, images)
     print(f"已写入 {bot.SOLVE_LOG}")
+    # 探针别往真会话历史里塞东西
+    try:
+        bot.store.clear_turns("probe")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

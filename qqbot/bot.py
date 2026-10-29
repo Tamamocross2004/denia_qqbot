@@ -484,11 +484,27 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
               max_tokens: int | None = None) -> str:
     c = cfg()
     max_turns = int(c.get("max_history_turns", 10))
-    hist = history.setdefault(key, [])
+    hist = history.get(key)
+    if hist is None:
+        # 进程重启后把库里的对话捞回来，接着上次说。
+        # 原来只有群聊缓冲落库，所以「你们刚聊到哪」一重启就断。
+        try:
+            hist = store.recent_turns(key, max_turns * 2)
+        except Exception as exc:
+            log.warning("读对话历史失败：%s", exc)
+            hist = []
+        history[key] = hist
 
     # 历史里只留文字版：多模态 content 带着 base64 滚进后续每一轮，token 会炸
     stored = prompt if not images else f"{prompt}\n（还发了 {len(images)} 张图）"
     hist.append({"role": "user", "content": stored})
+    evt = (ctx or {}).get("evt") or {}
+    try:
+        store.save_turn(key, "user", stored,
+                        evt.get("group_id") or 0, evt.get("user_id") or 0,
+                        max_turns * 2)
+    except Exception as exc:
+        log.debug("存对话历史失败：%s", exc)
 
     system = system or c.get("system_prompt", "")
     if (c.get("schedule") or {}).get("enable", True):
@@ -588,6 +604,12 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
 
     hist.append({"role": "assistant", "content": answer})
     del hist[:-max_turns * 2]
+    try:
+        store.save_turn(key, "assistant", answer,
+                        evt.get("group_id") or 0, evt.get("user_id") or 0,
+                        max_turns * 2)
+    except Exception as exc:
+        log.debug("存对话历史失败：%s", exc)
     return answer
 
 
@@ -2968,6 +2990,8 @@ async def handle(ws, evt: dict) -> None:
     # 内置指令
     if text in ("/reset", "重置"):
         history.pop(key, None)
+        n = store.clear_turns(key)
+        log.info("重置上下文：%s，清掉 %d 条落库对话", key, n)
         await reply(ws, evt, "上下文已清空。")
         return
     if text in ("/status", "状态"):

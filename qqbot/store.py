@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS video(
     transcript TEXT,
     ts         INTEGER NOT NULL
 );
+
+-- 对话历史：进程重启后还能接上「你们刚说到哪」
+CREATE TABLE IF NOT EXISTS turn(
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    sid     TEXT NOT NULL,            -- 会话键：g<群号>u<QQ> / p<QQ>
+    gid     INTEGER DEFAULT 0,
+    uid     INTEGER DEFAULT 0,
+    role    TEXT NOT NULL,            -- user / assistant
+    content TEXT NOT NULL,
+    ts      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_sid ON turn(sid, id);
 """
 
 
@@ -114,11 +126,52 @@ def recent_msgs(gid: int, limit: int = MSG_KEEP) -> list[dict]:
     return [dict(r) for r in reversed(rows)]
 
 
+# ---------- 对话历史 ----------
+# 以前 history 只在内存里，进程一重启就断片：她记得群里发生过什么，
+# 不记得自己上一句说过什么。落一张表就能接上。
+
+TURN_KEEP = 20          # 每个会话留多少条（= 10 轮）
+
+
+def save_turn(sid: str, role: str, content: str,
+              gid: int = 0, uid: int = 0, keep: int = TURN_KEEP) -> None:
+    if not sid or not content:
+        return
+    db = connect()
+    db.execute(
+        "INSERT INTO turn(sid, gid, uid, role, content, ts) VALUES(?,?,?,?,?,?)",
+        (sid, int(gid or 0), int(uid or 0), role, content[:4000], int(time.time())))
+    db.execute(
+        "DELETE FROM turn WHERE sid=? AND id NOT IN "
+        "(SELECT id FROM turn WHERE sid=? ORDER BY id DESC LIMIT ?)",
+        (sid, sid, keep))
+    db.commit()
+
+
+def recent_turns(sid: str, limit: int = TURN_KEEP) -> list[dict]:
+    """按时间正序返回 [{'role','content'}]，直接塞进 messages 用。"""
+    if not sid:
+        return []
+    rows = connect().execute(
+        "SELECT role, content FROM turn WHERE sid=? ORDER BY id DESC LIMIT ?",
+        (sid, limit)).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def clear_turns(sid: str) -> int:
+    if not sid:
+        return 0
+    db = connect()
+    n = db.execute("DELETE FROM turn WHERE sid=?", (sid,)).rowcount
+    db.commit()
+    return n
+
+
 def ping() -> str:
     """自检用：库在哪、各表多少行。"""
     db = connect()
     parts = []
-    for t in ("msg", "person", "memory"):
+    for t in ("msg", "person", "memory", "turn"):
         n = db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
         parts.append(f"{t}={n}")
     return f"{DB_PATH.name} " + " ".join(parts)
@@ -241,8 +294,15 @@ def _similar(a: str, b: str) -> float:
     return len(sa & sb) / max(1, len(sa | sb))
 
 
+# 梗记得太多会挤掉人事：2026-10-29 库里 200 条有 112 条是 meme，person 只剩 56 条。
+# 排序和淘汰都乘上类型系数，meme 先被挤出去。
+KIND_FACTOR = {"meme": 0.45, "person": 1.15, "event": 1.0}
+_KIND_SQL = ("weight * CASE kind WHEN 'meme' THEN 0.45 "
+             "WHEN 'person' THEN 1.15 ELSE 1.0 END")
+
+
 def prune(gid: int, per_person: int = 20, per_group: int = 200) -> None:
-    """按「权重 × 时间衰减」淘汰，防止无限膨胀。"""
+    """按「权重 × 类型系数 × 时间衰减」淘汰，防止无限膨胀。"""
     db = connect()
 
     def drop(rows):
@@ -252,18 +312,23 @@ def prune(gid: int, per_person: int = 20, per_group: int = 200) -> None:
             db.execute(f"DELETE FROM memory WHERE id IN ({marks})", ids)
 
     # 每个人在天花板之外的部分
+    # 注意是 DESC：按分数从高到低排，跳过前 per_person 条，剩下的才删。
+    # 原来写的是 ASC + OFFSET，删掉的是**分数最高**的那条——正好反了，
+    # 越重要的记忆死得越快（2026-10-29 发现，库里 200 条大半是梗）。
     for row in db.execute(
             "SELECT uid FROM memory WHERE gid=? AND uid>0 GROUP BY uid", (gid,)).fetchall():
         extra = db.execute(
             "SELECT id FROM memory WHERE gid=? AND uid=? ORDER BY "
-            "(weight * (1.0 / (1.0 + (? - ts) / 86400.0))) ASC LIMIT -1 OFFSET ?",
+            f"({_KIND_SQL} * (1.0 / (1.0 + (? - ts) / 86400.0))) DESC "
+            "LIMIT -1 OFFSET ?",
             (gid, row["uid"], int(time.time()), per_person)).fetchall()
         drop(extra)
 
-    # 群整体的天花板
+    # 群整体的天花板（同上，DESC 才是留强删弱）
     extra = db.execute(
         "SELECT id FROM memory WHERE gid=? ORDER BY "
-        "(weight * (1.0 / (1.0 + (? - ts) / 86400.0))) ASC LIMIT -1 OFFSET ?",
+        f"({_KIND_SQL} * (1.0 / (1.0 + (? - ts) / 86400.0))) DESC "
+        "LIMIT -1 OFFSET ?",
         (gid, int(time.time()), per_group)).fetchall()
     drop(extra)
     db.commit()
@@ -284,7 +349,7 @@ def memories_for(gid: int, uids: list[int] | None = None,
     rows = db.execute(
         "SELECT id, uid, kind, content, ts FROM memory WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY weight DESC, used_at ASC, ts DESC LIMIT ?",
+        + f" ORDER BY {_KIND_SQL} DESC, used_at ASC, ts DESC LIMIT ?",
         args + [limit]).fetchall()
     if rows:
         ids = [r["id"] for r in rows]
