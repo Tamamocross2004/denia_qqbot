@@ -2180,7 +2180,8 @@ def memory_block(evt: dict, text: str, bg: str = "") -> str:
         pass
 
     try:
-        rows = store.memories_for(gid, uids, limit=int(c.get("inject", 6)))
+        rows = store.memories_for(gid, uids, limit=int(c.get("inject", 6)),
+                                  hint=text)
     except Exception as exc:
         log.warning("查记忆失败：%s", exc)
         return ""

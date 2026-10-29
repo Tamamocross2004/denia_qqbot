@@ -334,9 +334,30 @@ def prune(gid: int, per_person: int = 20, per_group: int = 200) -> None:
     db.commit()
 
 
+def _bigrams(text: str, cap: int = 80) -> set[str]:
+    """中文按字二元组切，够用且不用分词。"""
+    t = "".join((text or "").split())[:cap]
+    if len(t) < 2:
+        return set(t)
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def _overlap(hint: str, content: str) -> float:
+    """这句话跟这条记忆的字面重合度，0~1。"""
+    a, b = _bigrams(hint), _bigrams(content)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a)
+
+
 def memories_for(gid: int, uids: list[int] | None = None,
-                 limit: int = 6) -> list[dict]:
-    """取这个群和指定几个人的记忆，最近注入得少的优先。"""
+                 limit: int = 6, hint: str = "") -> list[dict]:
+    """取这个群和指定几个人的记忆。
+
+    排序分三步：基础分（权重 × 类型系数）先粗排，再按这句话的**字面相关度**
+    加权，最后「很久没被想起来」的往前顶。原来只按权重和 used_at 排，
+    问她一个具体的人或事，取到的经常是几条无关的群梗。
+    """
     db = connect()
     uids = [u for u in (uids or []) if u]
     clauses, args = ["gid=?"], [gid]
@@ -346,18 +367,32 @@ def memories_for(gid: int, uids: list[int] | None = None,
         args += uids
     else:
         clauses.append("uid=0")
+    pool = max(limit * 8, 40)
     rows = db.execute(
-        "SELECT id, uid, kind, content, ts FROM memory WHERE "
+        "SELECT id, uid, kind, content, ts, "
+        f"({_KIND_SQL}) AS base FROM memory WHERE "
         + " AND ".join(clauses)
-        + f" ORDER BY {_KIND_SQL} DESC, used_at ASC, ts DESC LIMIT ?",
-        args + [limit]).fetchall()
+        + " ORDER BY base DESC, used_at ASC, ts DESC LIMIT ?",
+        args + [pool]).fetchall()
+
+    if hint:
+        scored = []
+        for r in rows:
+            # 相关度最多加 0.6，压不过一条明显更重的记忆，但足够把跑题的挤下去
+            scored.append((float(r["base"]) + 0.6 * _overlap(hint, r["content"]), r))
+        scored.sort(key=lambda x: (-x[0], -x[1]["ts"]))
+        rows = [r for _, r in scored][:limit]
+    else:
+        rows = rows[:limit]
+
     if rows:
         ids = [r["id"] for r in rows]
         marks = ",".join("?" * len(ids))
         db.execute(f"UPDATE memory SET used_at=? WHERE id IN ({marks})",
                    [int(time.time())] + ids)
         db.commit()
-    return [dict(r) for r in rows]
+    return [{"id": r["id"], "uid": r["uid"], "kind": r["kind"],
+             "content": r["content"], "ts": r["ts"]} for r in rows]
 
 
 # ---------- 视频转写缓存 ----------
