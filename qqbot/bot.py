@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
@@ -222,6 +222,86 @@ seen_ids = deque(maxlen=800)
 def segments(evt: dict) -> list[dict]:
     msg = evt.get("message")
     return msg if isinstance(msg, list) else []
+
+
+# 引用的原文：QQ 在 reply 段里只给一个 message_id，正文得回头用 get_msg 取。
+# 以前这一段直接压成 "[回复]" 就丢了，她只看到一个孤零零的「很有理解」，
+# 根本不知道在夸哪句（2026-10-29 群友原话：「看不了引用也太蠢了」）。
+QUOTE_CACHE: "OrderedDict[str, str]" = OrderedDict()
+QUOTE_CACHE_MAX = 300
+
+
+def quote_ids(evt: dict) -> list[str]:
+    return [str((s.get("data") or {}).get("id") or "")
+            for s in segments(evt) if s.get("type") == "reply"]
+
+
+def _brief_segments(segs: list[dict], skip: tuple = ()) -> str:
+    """消息段 -> 一行摘要。引用会就地展开成「原文」。
+
+    skip 用来摘掉不要的段类型（取引用时 [表情] 是纯噪音）。
+    """
+    parts = []
+    for s in segs:
+        if not isinstance(s, dict):
+            continue
+        kind = s.get("type")
+        data = s.get("data") or {}
+        if kind == "text":
+            parts.append(str(data.get("text") or ""))
+        elif kind == "image":
+            parts.append("[图片]")
+        elif kind == "face":
+            if "face" not in skip:
+                parts.append("[表情]")
+        elif kind == "at":
+            qq = data.get("qq")
+            parts.append(f"@{qq}" if qq else "@")
+        elif kind == "reply":
+            quoted = QUOTE_CACHE.get(str(data.get("id") or ""))
+            if quoted and len(quoted) > 40:
+                quoted = quoted[:40] + "…"
+            parts.append(f"[回复「{quoted}」]" if quoted else "[回复]")
+        elif kind in ("json", "xml", "share", "video"):
+            # 分享卡片以前整段被丢掉，等于她连"谁发了条视频"都不知道
+            parts.append(video.brief_of(s))
+    return "".join(parts).strip()
+
+
+async def resolve_quotes(ws, evt: dict) -> None:
+    """把 reply 段指向的原文取回来，塞进 QUOTE_CACHE。"""
+    if ws is None:
+        return
+    for mid in quote_ids(evt):
+        if not mid or mid in QUOTE_CACHE:
+            continue
+        try:
+            resp = await call_api(
+                ws, "get_msg",
+                {"message_id": int(mid) if mid.isdigit() else mid}, timeout=6)
+        except Exception as exc:
+            log.info("取引用原文失败（id=%s）：%s", mid, exc)
+            continue
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if not isinstance(data, dict):
+            log.info("get_msg 返回异常：%r", str(resp)[:200])
+            continue
+        segs = data.get("message")
+        text = (_brief_segments(segs, skip=("face",))
+                if isinstance(segs, list) else "") or str(data.get("raw_message") or "")
+        text = " ".join(text.split()).strip()
+        if not text:
+            continue
+        if len(text) > 80:
+            text = text[:80] + "…"
+        sender = data.get("sender") or {}
+        who = str(sender.get("card") or sender.get("nickname") or "").strip()
+        if str(data.get("user_id")) == str(evt.get("self_id")):
+            who = "你自己"
+        QUOTE_CACHE[mid] = f"{who}：{text}" if who else text
+        log.info("引用原文：%s", QUOTE_CACHE[mid])
+        while len(QUOTE_CACHE) > QUOTE_CACHE_MAX:
+            QUOTE_CACHE.popitem(last=False)
 
 
 def text_of(evt: dict) -> str:
@@ -1633,24 +1713,7 @@ def looks_like_name(text: str) -> bool:
 
 def _brief(evt: dict) -> str:
     """把一条消息压成一行摘要，供上下文用。"""
-    parts = []
-    for s in segments(evt):
-        kind = s.get("type")
-        data = s.get("data", {})
-        if kind == "text":
-            parts.append(data.get("text", ""))
-        elif kind == "image":
-            parts.append("[图片]")
-        elif kind == "face":
-            parts.append("[表情]")
-        elif kind == "at":
-            parts.append(f"@{data.get('qq')}")
-        elif kind == "reply":
-            parts.append("[回复]")
-        elif kind in ("json", "xml", "share", "video"):
-            # 分享卡片以前整段被丢掉，等于她连"谁发了条视频"都不知道
-            parts.append(video.brief_of(s))
-    return "".join(parts).strip()
+    return _brief_segments(segments(evt))
 
 
 def _nick_of_evt(evt: dict) -> str:
@@ -2607,6 +2670,9 @@ async def handle(ws, evt: dict) -> None:
 
     is_group = evt.get("message_type") == "group"
 
+    # 引用原文要先去取，否则 remember() 写进缓冲的也只有一个 "[回复]"
+    await resolve_quotes(ws, evt)
+
     # 先取背景（不含当前这条），再把当前这条记进缓冲
     bg = recent_context(evt.get("group_id")) if is_group else ""
     if is_group:
@@ -2778,6 +2844,14 @@ async def handle(ws, evt: dict) -> None:
     extra = "\n\n".join(extra_parts)
 
     prompt = text or "（对方只发了一张图，一个字都没写）"
+    quotes = [QUOTE_CACHE[m] for m in quote_ids(evt) if QUOTE_CACHE.get(m)]
+    if quotes:
+        # 放进 prompt 而不是 extra：extra 里那一堆是「背景资料，别逐条回应」，
+        # 引用是这句话的宾语，必须当成正文的一部分。
+        prompt = ("【对方引用了下面这条消息，他要说的就是它】\n"
+                  + "\n".join(f"「{q}」" for q in quotes)
+                  + f"\n\n【他写的是】\n{text or '（只引用，没写字）'}"
+                  + "\n（回应要接着被引用的那句说，别只回他后面那几个字）")
     rounds = 4
     solve_model = None
     solve_ocr = ""

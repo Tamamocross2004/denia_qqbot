@@ -79,6 +79,10 @@ def build_event(args) -> dict:
                 {"type": "text", "data": {"text": " " + args.text}},
             ]
             raw = f"[CQ:at,qq={self_id}] {args.text}"
+        if args.reply:
+            # 引用一条（假的）原文，验证 bot 会不会回去取 get_msg
+            msg.insert(0, {"type": "reply", "data": {"id": str(QUOTE_ID)}})
+            raw = f"[CQ:reply,id={QUOTE_ID}]" + raw
         if args.image:
             msg.append(image_segment(args, getattr(args, "url_port", 0)))
             raw += "[CQ:image,file=test]"
@@ -131,11 +135,26 @@ MOCK_API = {
     "get_group_member_list": [],
 }
 
+# 假的「被引用的那条消息」。--reply 时 bot 会拿这个 id 来调 get_msg，
+# 真机（NapCat / SnowLuma）返回的结构就是这样。
+QUOTE_ID = 880001
+QUOTE_MSG = {
+    "message_id": QUOTE_ID,
+    "message_type": "group",
+    "user_id": 20002,
+    "raw_message": "驱动这东西，新版是给新卡修的，老卡跟着升，纯属给厂家当测试员",
+    "message": [{"type": "text", "data": {
+        "text": "驱动这东西，新版是给新卡修的，老卡跟着升，纯属给厂家当测试员"}}],
+    "sender": {"user_id": 20002, "nickname": "达达妮娅", "card": "达达妮娅"},
+}
+
 
 def mock_data(action: str) -> dict:
     if action == "get_image":
         p = IMG_STATIC.get("path")
         return {"file": str(p) if p else "", "url": ""}
+    if action == "get_msg":
+        return QUOTE_MSG
     return MOCK_API.get(action, {})
 
 
@@ -145,6 +164,8 @@ async def main() -> int:
     ap.add_argument("--group", type=int, default=0, help="群号；不填则模拟私聊")
     ap.add_argument("--no-at", action="store_true",
                     help="群消息里不带 @，用来模拟群友闲聊（不会触发机器人）")
+    ap.add_argument("--reply", action="store_true",
+                    help="带一个 reply 段（引用一条假消息），验证 bot 会不会去取原文")
     ap.add_argument("--poke", action="store_true",
                     help="发一条拍一拍事件；--target 默认是机器人自己")
     ap.add_argument("--target", type=int, default=0,
