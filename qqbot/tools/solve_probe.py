@@ -30,7 +30,7 @@ async def main() -> None:
     print(ocr)
     print("--- 解题 ---")
 
-    extra = bot.SOLVE_RULES.format(ocr=ocr)
+    extra = bot.SOLVE_RULES.replace("{ocr}", ocr)
     vc = bot.cfg().get("vision") or {}
     answer = await bot.ask(
         "probe", text, {"ws": None, "evt": {}, "group_id": None},

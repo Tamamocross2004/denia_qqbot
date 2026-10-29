@@ -1457,14 +1457,21 @@ IDENT_VISION_SYSTEM = (
 
 IDENT_RULES = (
     "【图已经看过了，视觉那边看到的是下面这些】\n{desc}\n\n"
+    "【你认得的人，先对一下外形】\n{roster}\n\n"
     "【怎么回答】\n"
-    "1. 有候选名就先 web_search 查一下（查「名字 + 作品 + 外貌」），"
-    "作品和外形都对得上再说名字。\n"
-    "2. 查不到、或者外形跟候选对不上，就直接说认不出——"
-    "可以描述你看到的特征，但不许给名字。"
-    "「看着像谁但不确定」也比说错强（上次就是把一个角色认成了另一个）。\n"
-    "3. 同款造型的角色一大把，光凭「橙发双辫、比个耶」这种特征下不了结论。\n"
-    "4. 答完别解释这套流程，也别提「视觉模型」「工具」这些词。")
+    "1. 拿描述跟上面这些人逐一核对：发色、发型、配饰只要**明显不符**就排除。"
+    "图里闭着眼、被挡住、糊掉的项算「看不到」，**不算不符**——别因为看不到瞳色就把人对掉。\n"
+    "2. 有候选名就先 web_search 查「名字 + 作品 + 外貌」；一个候选都没有、"
+    "或者全被排除掉，就用外形去搜：作品 + 发色 + 发型 + 最显眼的配饰，"
+    "比如「鸣潮 橙发 双麻花辫 白色头饰 角色 是谁」。搜出来的名字同样要再核对一遍。\n"
+    "3. 至少查一次再决定说认不出——除非一眼就是真人照片、聊天截图，"
+    "或者糊得什么都看不清。\n"
+    "4. 只有出现**互相矛盾**的证据才说认不出（比如发色就跟人对不上）。"
+    "只是没看全，就按最像的那个说，把没看到的项讲清楚——"
+    "「橙发双麻花辫白尖角头饰，瞳色看不到但别的都对得上」这样，"
+    "比干巴巴一句「认不出」有用。真拿不准再加半句留余地。\n"
+    "5. 同款造型的角色一大把，光凭「橙发双辫、比个耶」下不了结论。\n"
+    "6. 答完别解释这套流程，也别提「视觉模型」「工具」这些词。")
 
 VISION_CASUAL = (
     "【图就在这条消息里】直接说你看到了什么、什么反应，"
@@ -2222,6 +2229,26 @@ def lore_lookup(*texts: str, limit: int = 4) -> tuple[str, list[str]]:
 
 def lore_hits(*texts: str, limit: int = 4) -> str:
     return lore_lookup(*texts, limit=limit)[0]
+
+
+def look_roster() -> str:
+    """lore.json 里带 look 的角色外形，拼成一行一条，给识图对照用。
+
+    群友问「这是谁」时正文里往往没有名字，lore_lookup() 命不中；
+    但外形她本来就该认得——西格莉卡是她同学。
+    """
+    try:
+        data = json.loads(LORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    rows = []
+    for name, val in data.items():
+        look = val.get("look") if isinstance(val, dict) else None
+        if isinstance(look, str) and look.strip():
+            rows.append(f"- {name}：{look.strip()}")
+    return "\n".join(rows)
 
 
 # ---------- 角色关系网 ----------
@@ -3085,7 +3112,7 @@ async def handle(ws, evt: dict) -> None:
             ocr = await ocr_image(images)
             if ocr:
                 # 图已经变成文字了，就别再把它发给文本模型
-                extra = (extra + "\n\n" if extra else "") + SOLVE_RULES.format(ocr=ocr)
+                extra = (extra + "\n\n" if extra else "") + SOLVE_RULES.replace("{ocr}", ocr)
                 log.info("看图当解题：%r，OCR %d 字，转文本模型分步解",
                          (text or "")[:24], len(ocr))
                 solve_ocr = ocr
@@ -3106,11 +3133,15 @@ async def handle(ws, evt: dict) -> None:
             desc = await identify_image(images)
             if desc:
                 # 描述拿到就把图撤掉：这一段不带图，才能挂上 web_search 查证
-                extra = (extra + "\n\n" if extra else "") + IDENT_RULES.format(desc=desc)
+                # 用 replace 不用 format：视觉描述里可能带 { }，format 会直接抛
+                extra = (extra + "\n\n" if extra else "") + (
+                    IDENT_RULES.replace("{desc}", desc)
+                    .replace("{roster}", look_roster() or "（暂时没有）"))
                 log.info("识图认人：%r，视觉描述 %d 字：%r",
                          (text or "")[:24], len(desc), desc[:120])
                 images = []
                 rounds = 6
+                solve_kw = {"temperature": 0.3}   # 认人要稳，别每次给个不同的名字
             else:
                 extra = (extra + "\n\n" if extra else "") + VISION_CASUAL
                 log.info("识图描述没出来，退回单次看图")
