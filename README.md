@@ -407,7 +407,7 @@ cd D:/code/deepseek/qqbot
 | `schedule.enable` | 把当前时段注入 system（深夜更敷衍、清早有起床气），同时撤掉 `get_time` 工具 |
 | `vision.enable` | 允不允许看图。关掉后图片只当 `[图片]` 处理 |
 | `vision.model` | 视觉模型，默认 `deepseek-v4-flash-vision-exp` |
-| `vision.max_images` | 一条消息最多看几张 |
+| `vision.max_images` | 一条消息最多看几张；也决定「上面那几张图」回捞几张 |
 | `vision.solve_model` | 解题那段用的模型（默认 `deepseek-v4-pro`） |
 | `vision.solve_temperature` | 解题温度，必须是 0；0.7 会让同一道题每次答案都不同 |
 | `vision.solve_max_tokens` | 解题的回答上限，默认 2600；1400 写不完三问大题 |
@@ -1019,6 +1019,26 @@ qqbot/.venv/Scripts/python.exe qqbot/tools/solve_probe.py qqbot/logs/solve/<ts>_
 ```
 
 `solve_probe.py` 走的是 `bot.py` 里一模一样的 OCR → SOLVE_RULES → 文本模型带 `calc` 的路径，不经过 QQ，可以直接当回归测试跑。
+
+### 图不在这条消息里的时候
+
+群友的常见操作是**先甩两张图，再 @ 她说「这两张图讲了什么」**。图片在上一两条消息里，当前这条只有文字：`collect_images(evt)` 什么也拿不到，她只看到背景里的 `[图片]` 占位符，于是回一句「两张图我这儿没显示出来，只有占位符……你重发一次？」（2026-10-29 12:25 原话）。
+
+现在每条群消息的图片段都会记一笔：
+
+- `note_images(evt)`：`RECENT_IMAGES[群号]` 存最近 8 条带图消息（只存段，不存字节，不占内存）。
+- 当前消息没图、而文字里提到图（`refers_to_images()`：必须同时有「图」和 以上/上面/刚才/这两/两张/看图/图里/截图 之类的词，所以「图书馆」不会误伤）→ `collect_recent_images()` 往回捞，5 分钟内、最多 `vision.max_images` 张，按发送顺序排好。
+- 捞到了会在 extra 里加一句 `VISION_BACKFILL`：「图在上面几条消息里，直接按图回答，别说没收到图」。
+- 问法决定提示词：`这题怎么做` 走解题（OCR + calc），`讲了什么 / 什么内容 / 读一下` 走 `VISION_DESC`（逐张说清是什么、关键内容、看不清就说看不清，250 字），其余走 `VISION_CASUAL` 随口吐槽。
+
+实测（`handle()` 直接喂三条事件，两条各带一张图、第三条只 @ 她说「这两张图讲了什么」）：
+
+```
+17:57:24 当前消息没带图，从上面几条捞回 2 张
+17:57:24 看图当说内容：'这两张图讲了什么'，2 张
+A='第一张是群公告，说明天上午九点实验楼集合、带笔记本…第二张是订单详情，
+   一把87键机械键盘，已发货，预计10月31日送达。所以你是打算带着新键盘去迟到的？'
+```
 
 ### 配置
 

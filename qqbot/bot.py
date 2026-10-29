@@ -1407,6 +1407,20 @@ VISION_CASUAL = (
     "【图就在这条消息里】直接说你看到了什么、什么反应，"
     "别用「这张图片显示」「图中是一位」这种识图腔，像个真人瞄了一眼随口吐个槽。"
     "图太糊或看不出重点就直说看不清，别硬编细节。")
+# 「这两张图讲了什么」要的是内容，不是吐槽。她原来走 VISION_CASUAL，
+# 只回一句评价，等于没读。
+VISION_DESC = (
+    "【对方想知道图里是什么内容，不是要你评价】\n"
+    "① 有几张就一张一张说，每张先用一句话说清它是什么：聊天记录、文章截图、"
+    "商品页、成绩单、表情包还是照片。\n"
+    "② 再说图上真正写了什么：标题、结论、关键数字、谁说了什么话。"
+    "捡要紧的抄，别逐字念一遍。\n"
+    "③ 有字看不清就直说哪一块看不清，别猜着补。\n"
+    "这条不用管平时那个 100 字限制，可以写到 250 字。别用「这张图片显示」这种腔调。")
+# 图来自上面几条消息（群友先甩图、再 @ 她问），提醒她别当成现在这条带的
+VISION_BACKFILL = (
+    "【注意】图是对方刚在上面几条消息里发的，不在他现在这句话里——"
+    "所以只看得到图、看不到他配的文字。直接按图回答，别说「没收到图」「显示不出来」。")
 VISION_SOLVE = (
     "【图里是题目/试卷/代码报错这类要被解决的东西，按这个来】\n"
     "① 先把题目条件读出来：数字、公式、区间、选项，一个都别漏；"
@@ -1651,6 +1665,72 @@ async def collect_images(ws, evt: dict) -> list[bytes]:
         out.append(data)
     if segs:
         log.info("收到 %d 张图，取到 %d 张", len(segs), len(out))
+    return out
+
+
+# 群友常先甩图、再 @ 她说「这两张图讲了什么」。图片在**上一条**消息里，
+# 当前这条只有文字，collect_images() 什么也拿不到，她只能看见背景里的
+# [图片] 占位符，然后回一句「我这儿没显示出来」——2026-10-29 就是这样。
+# 所以每条群消息的图片段都记一份，被问到时往回捞。
+RECENT_IMAGES: dict[int, deque] = {}
+IMG_GAP = 300.0        # 5 分钟内的图才算「刚才发的」
+IMG_KEEP = 8           # 每个群记最近 8 条带图消息
+# 「在说上面那些图」的说法。只认这些，避免「图书馆」这种撞词。
+IMG_REF_RE = re.compile(
+    r"(以上|上面|刚才|刚刚|前面|这两|这几|这张|那张|这些图|两张|三张|几张"
+    r"|看图|读图|识图|图里|图上|图片|截图)")
+
+# 要她「说图里是什么内容」而不是随口吐槽
+IMG_DESC_RE = re.compile(
+    r"(讲了什么|讲什么|说的什么|写了什么|什么内容|读一下|念一下|翻译一下"
+    r"|总结一下|什么意思|啥意思|什么梗)")
+
+
+def note_images(evt: dict) -> None:
+    """把带图消息的图片段记进群缓存，供后面「上面那两张图」回捞。"""
+    segs = [s for s in segments(evt) if s.get("type") == "image"]
+    if not segs:
+        return
+    gid = evt.get("group_id")
+    dq = RECENT_IMAGES.get(gid)
+    if dq is None:
+        dq = RECENT_IMAGES[gid] = deque(maxlen=IMG_KEEP)
+    dq.append((time.monotonic(), int(evt.get("user_id") or 0), segs))
+
+
+def refers_to_images(text: str) -> bool:
+    return "图" in text and bool(IMG_REF_RE.search(text))
+
+
+async def collect_recent_images(ws, evt: dict) -> list[bytes]:
+    """当前消息没图、但对方在说「上面那些图」时，把刚才的图捞回来。"""
+    c = cfg().get("vision") or {}
+    if not c.get("enable", True):
+        return []
+    dq = RECENT_IMAGES.get(evt.get("group_id"))
+    if not dq:
+        return []
+    limit = max(1, int(c.get("max_images", 2)))
+    now = time.monotonic()
+    out: list[bytes] = []
+    for ts, _uid, segs in reversed(dq):
+        if now - ts > IMG_GAP:
+            continue
+        for seg in reversed(segs):        # 同一条里也从后往前，取到就跳
+            if len(out) >= limit:
+                break
+            try:
+                data = await image_to_bytes(ws, seg)
+            except Exception as exc:
+                log.debug("回捞图片失败：%s", exc)
+                continue
+            if data and len(data) <= IMG_MAX_BYTES:
+                out.append(data)
+        if len(out) >= limit:
+            break
+    out.reverse()                          # 恢复成发送顺序
+    if out:
+        log.info("当前消息没带图，从上面几条捞回 %d 张", len(out))
     return out
 
 
@@ -2672,6 +2752,9 @@ async def handle(ws, evt: dict) -> None:
 
     # 引用原文要先去取，否则 remember() 写进缓冲的也只有一个 "[回复]"
     await resolve_quotes(ws, evt)
+    if is_group:
+        # 图片先记一笔：等他下一条 @ 她说「这两张图讲了什么」时才有得捞
+        note_images(evt)
 
     # 先取背景（不含当前这条），再把当前这条记进缓冲
     bg = recent_context(evt.get("group_id")) if is_group else ""
@@ -2802,6 +2885,10 @@ async def handle(ws, evt: dict) -> None:
         reset_chime(evt.get("group_id"))   # 她刚说过话，插话计时重新开始
 
     images = await collect_images(ws, evt) if has_image else []
+    backfilled = False
+    if not images and is_group and refers_to_images(text):
+        images = await collect_recent_images(ws, evt)
+        backfilled = bool(images)
     picked_images = images   # 解题存档要用原图，下面 images 会被清空
 
     extra_parts = []
@@ -2857,6 +2944,8 @@ async def handle(ws, evt: dict) -> None:
     solve_ocr = ""
     solve_kw: dict = {}
     if images:
+        if backfilled:
+            extra = (extra + "\n\n" if extra else "") + VISION_BACKFILL
         if VISION_TASK_RE.search(text):
             ocr = await ocr_image(images)
             if ocr:
@@ -2878,6 +2967,9 @@ async def handle(ws, evt: dict) -> None:
             else:
                 extra = (extra + "\n\n" if extra else "") + VISION_SOLVE
                 log.info("OCR 没抄出东西，退回单次看图解题")
+        elif IMG_DESC_RE.search(text):
+            extra = (extra + "\n\n" if extra else "") + VISION_DESC
+            log.info("看图当说内容：%r，%d 张", (text or "")[:24], len(images))
         else:
             extra = (extra + "\n\n" if extra else "") + VISION_CASUAL
 
