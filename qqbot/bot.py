@@ -229,6 +229,10 @@ def segments(evt: dict) -> list[dict]:
 # 根本不知道在夸哪句（2026-10-29 群友原话：「看不了引用也太蠢了」）。
 QUOTE_CACHE: "OrderedDict[str, str]" = OrderedDict()
 QUOTE_CACHE_MAX = 300
+# 引用里如果是图/动图，正文只有 "[图片]" 三个字，她等于没看见。
+# 图片段单独存一份，真的被叫到时再去取字节（不预先下载，省流量）。
+QUOTE_IMG_SEGS: "OrderedDict[str, list]" = OrderedDict()
+QUOTE_IMG_MAX = 200
 
 
 def quote_ids(evt: dict) -> list[str]:
@@ -250,7 +254,7 @@ def _brief_segments(segs: list[dict], skip: tuple = ()) -> str:
         if kind == "text":
             parts.append(str(data.get("text") or ""))
         elif kind == "image":
-            parts.append("[图片]")
+            parts.append("[动图]" if str(data.get("sub_type")) == "1" else "[图片]")
         elif kind == "face":
             if "face" not in skip:
                 parts.append("[表情]")
@@ -302,6 +306,39 @@ async def resolve_quotes(ws, evt: dict) -> None:
         log.info("引用原文：%s", QUOTE_CACHE[mid])
         while len(QUOTE_CACHE) > QUOTE_CACHE_MAX:
             QUOTE_CACHE.popitem(last=False)
+        if isinstance(segs, list):
+            imgs = [s for s in segs
+                    if isinstance(s, dict) and s.get("type") == "image"]
+            if imgs:
+                QUOTE_IMG_SEGS[mid] = imgs
+                log.info("引用的是一条图（%d 张），被问到时再取", len(imgs))
+                while len(QUOTE_IMG_SEGS) > QUOTE_IMG_MAX:
+                    QUOTE_IMG_SEGS.popitem(last=False)
+
+
+async def images_from_quote(ws, evt: dict) -> list[bytes]:
+    """引用的那条本身就是图/动图 -> 取出来给她看。"""
+    c = cfg().get("vision") or {}
+    if not c.get("enable", True):
+        return []
+    limit = max(1, int(c.get("max_images", 2)))
+    for mid in quote_ids(evt):
+        segs = QUOTE_IMG_SEGS.get(mid)
+        if not segs:
+            continue
+        out: list[bytes] = []
+        for seg in segs[:limit]:
+            try:
+                data = await image_to_bytes(ws, seg)
+            except Exception as exc:
+                log.debug("取引用图异常：%s", exc)
+                continue
+            if data and len(data) <= IMG_MAX_BYTES:
+                out.append(data)
+        if out:
+            log.info("引用里的图，取到 %d 张", len(out))
+            return out
+    return []
 
 
 def text_of(evt: dict) -> str:
@@ -1421,6 +1458,11 @@ VISION_DESC = (
 VISION_BACKFILL = (
     "【注意】图是对方刚在上面几条消息里发的，不在他现在这句话里——"
     "所以只看得到图、看不到他配的文字。直接按图回答，别说「没收到图」「显示不出来」。")
+# 引用那条本身就是图/动图：图已经给了，别再顺杆编
+VISION_QUOTED_IMG = (
+    "【注意】他引用的是他自己发过的一张图，图已经送到你手里了（动图只给了第一帧）。"
+    "直接按图回答，别说「看不到图」。图里是什么就说什么，认不出就直说认不出，"
+    "别顺着他的话猜——他多半就在试你会不会硬编。")
 VISION_SOLVE = (
     "【图里是题目/试卷/代码报错这类要被解决的东西，按这个来】\n"
     "① 先把题目条件读出来：数字、公式、区间、选项，一个都别漏；"
@@ -1512,7 +1554,38 @@ def _download(url: str, timeout: float = 15.0) -> bytes:
         return resp.read(IMG_MAX_BYTES + 1)
 
 
+def _still_frame(data: bytes) -> bytes:
+    """动图只取第一帧。
+
+    视觉模型吃的是静态图，群里的 GIF / 动画表情直接丢过去要么被拒、
+    要么只看个残缺。PIL 读首帧转 JPEG，动图也能看出是什么。
+    """
+    mime = _sniff_mime(data) or ""
+    if mime not in ("image/gif", "image/webp"):
+        return data
+    try:
+        from PIL import Image
+    except ImportError:
+        return data
+    import io
+    try:
+        im = Image.open(io.BytesIO(data))
+        im.seek(0)
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, "JPEG", quality=90)
+        return buf.getvalue()
+    except Exception as exc:
+        log.debug("动图取首帧失败：%s", exc)
+        return data
+
+
 async def image_to_bytes(ws, seg: dict) -> bytes | None:
+    """一个 image 段 -> 可以直接喂模型的字节。三级兜底，哪级通就用哪级。"""
+    data = await _image_to_bytes_raw(ws, seg)
+    return _still_frame(data) if data else None
+
+
+async def _image_to_bytes_raw(ws, seg: dict) -> bytes | None:
     """一个 image 段 -> 原始字节。三级兜底，哪级通就用哪级。"""
     d = seg.get("data") or {}
 
@@ -2885,10 +2958,15 @@ async def handle(ws, evt: dict) -> None:
         reset_chime(evt.get("group_id"))   # 她刚说过话，插话计时重新开始
 
     images = await collect_images(ws, evt) if has_image else []
-    backfilled = False
+    img_src = ""            # "" = 就在这条消息里，quote = 引用那条是图，recent = 上面几条
+    if not images:
+        images = await images_from_quote(ws, evt)
+        if images:
+            img_src = "quote"
     if not images and is_group and refers_to_images(text):
         images = await collect_recent_images(ws, evt)
-        backfilled = bool(images)
+        if images:
+            img_src = "recent"
     picked_images = images   # 解题存档要用原图，下面 images 会被清空
 
     extra_parts = []
@@ -2944,7 +3022,9 @@ async def handle(ws, evt: dict) -> None:
     solve_ocr = ""
     solve_kw: dict = {}
     if images:
-        if backfilled:
+        if img_src == "quote":
+            extra = (extra + "\n\n" if extra else "") + VISION_QUOTED_IMG
+        elif img_src == "recent":
             extra = (extra + "\n\n" if extra else "") + VISION_BACKFILL
         if VISION_TASK_RE.search(text):
             ocr = await ocr_image(images)
