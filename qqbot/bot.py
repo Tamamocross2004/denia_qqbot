@@ -1440,6 +1440,32 @@ VISION_FALLBACK = "deepseek-v4-flash-vision-exp"
 # 看图分两种：随手拍（随口吐槽）和「要解决的东西」（读题、分步、给答案）。
 # 实测差别很大：同一张线性规划题，闲聊版答 x=2,y=4 利润 2000（错），
 # 解题版会去枚举整数点、发现 (3,3) 才是 2100（对）。
+# 「这是谁」是另一类活：不能靠一次视觉调用拍脑袋。实测她把西格莉卡认成
+# 爱弥斯，就是因为带图那次连 web_search 都没有（ask() 里 images 分支不挂
+# 工具），视觉模型只能凭内部印象硬给一个名字。改成两段：先描述取舍，再查证。
+IDENT_RE = re.compile(
+    r"(这是谁|是谁|谁啊|这人|这角色|哪个角色|什么角色|出自哪|哪部|哪款游戏"
+    r"|认得吗|认识吗|认不认识|猜猜这是|看着像谁)")
+
+IDENT_VISION_SYSTEM = (
+    "你只做识别描述，不下结论。按顺序说：\n"
+    "① 这是真人照片、二次元立绘、动画截图还是表情包；\n"
+    "② 头发颜色和发型、瞳色、服装、配饰、姿势、表情；\n"
+    "③ 画面里有没有文字、logo、水印、角色名牌——有就逐字抄下来；\n"
+    "④ 最后给 0~2 个候选角色名，按像的程度排，每个后面标「不确定」。\n"
+    "你并不认识所有角色：不认识就写「不认识」，宁可空着也别填个名字凑数。")
+
+IDENT_RULES = (
+    "【图已经看过了，视觉那边看到的是下面这些】\n{desc}\n\n"
+    "【怎么回答】\n"
+    "1. 有候选名就先 web_search 查一下（查「名字 + 作品 + 外貌」），"
+    "作品和外形都对得上再说名字。\n"
+    "2. 查不到、或者外形跟候选对不上，就直接说认不出——"
+    "可以描述你看到的特征，但不许给名字。"
+    "「看着像谁但不确定」也比说错强（上次就是把一个角色认成了另一个）。\n"
+    "3. 同款造型的角色一大把，光凭「橙发双辫、比个耶」这种特征下不了结论。\n"
+    "4. 答完别解释这套流程，也别提「视觉模型」「工具」这些词。")
+
 VISION_CASUAL = (
     "【图就在这条消息里】直接说你看到了什么、什么反应，"
     "别用「这张图片显示」「图中是一位」这种识图腔，像个真人瞄了一眼随口吐个槽。"
@@ -1683,6 +1709,35 @@ async def ocr_image(images: list[bytes]) -> str:
         return (resp.choices[0].message.content or "").strip()
     except Exception as exc:
         log.warning("OCR 失败：%s", exc)
+        return ""
+
+
+async def identify_image(images: list[bytes]) -> str:
+    """识人第一段：只要外形描述和候选，不让它下结论。
+
+    尺寸不做处理——认人要细节，压缩只会更认不出。
+    """
+    if not images:
+        return ""
+    c = cfg()
+    model = ((c.get("vision") or {}).get("model")) or VISION_FALLBACK
+    parts: list[dict] = [{"type": "text", "text": "描述图里这个人/角色，给候选"}]
+    for b in images:
+        mime = _sniff_mime(b) or "image/jpeg"
+        parts.append({"type": "image_url", "image_url": {
+            "url": f"data:{mime};base64,{base64.b64encode(b).decode()}"}})
+    try:
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": IDENT_VISION_SYSTEM},
+                          {"role": "user", "content": parts}],
+                max_tokens=600, temperature=0,
+                extra_body={"thinking": {"type": "disabled"}}),
+            timeout=45)
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as exc:
+        log.warning("识图描述失败：%s", exc)
         return ""
 
 
@@ -3047,6 +3102,18 @@ async def handle(ws, evt: dict) -> None:
             else:
                 extra = (extra + "\n\n" if extra else "") + VISION_SOLVE
                 log.info("OCR 没抄出东西，退回单次看图解题")
+        elif IDENT_RE.search(text):
+            desc = await identify_image(images)
+            if desc:
+                # 描述拿到就把图撤掉：这一段不带图，才能挂上 web_search 查证
+                extra = (extra + "\n\n" if extra else "") + IDENT_RULES.format(desc=desc)
+                log.info("识图认人：%r，视觉描述 %d 字：%r",
+                         (text or "")[:24], len(desc), desc[:120])
+                images = []
+                rounds = 6
+            else:
+                extra = (extra + "\n\n" if extra else "") + VISION_CASUAL
+                log.info("识图描述没出来，退回单次看图")
         elif IMG_DESC_RE.search(text):
             extra = (extra + "\n\n" if extra else "") + VISION_DESC
             log.info("看图当说内容：%r，%d 张", (text or "")[:24], len(images))
