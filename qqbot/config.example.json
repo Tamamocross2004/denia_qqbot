@@ -119,5 +119,9 @@
       "device": "cpu",
       "compute_type": "int8"
     }
+  },
+  "meme": {
+    "enable": true,
+    "max_chars": 130
   }
 }

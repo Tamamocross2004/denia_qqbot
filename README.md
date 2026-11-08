@@ -411,6 +411,8 @@ cd D:/code/deepseek/qqbot
 | `vision.solve_model` | 解题那段用的模型（默认 `deepseek-v4-pro`） |
 | `vision.solve_temperature` | 解题温度，必须是 0；0.7 会让同一道题每次答案都不同 |
 | `vision.solve_max_tokens` | 解题的回答上限，默认 2600；1400 写不完三问大题 |
+| `meme.enable` | 梗库开不开（默认 `true`）。关掉就只剩手写黑话词典 |
+| `meme.max_chars` | 一条梗词条注入多少字（默认 130，取 `usage` 字段） |
 | `video.enable` | 允不允许看群友发的视频链接。关掉后链接只当普通消息 |
 | `video.proactive` | 没人理她时，自己捡半小时内没人接话的视频吐槽 |
 | `video.max_seconds` | 转写最多取前多少秒（默认 600），长视频不会被拖死 |
@@ -1316,6 +1318,42 @@ Whisper 最怕专有名词。同一条视频（`BV1MQnf6NEJJ`，讲 GPT-6.1 Terr
 - **只写两个字符以上的词**，单字会误伤（`急` 会命中「着**急**」）。代码里也有 `len(k) >= 2` 的兜底。
 - 你群里的专属梗才是重点：群友外号、内部事件、缩写。通用网络词模型基本都认识，不用写。
 - 存盘即生效，不用重启。
+
+**②b 梗库** `qqbot/memes.db`。手写词典只有 80 来条，通用网络梗覆盖不到；这里接了一份 6792 条的公开词库（数据来自 cnmeme.wiki，整理自 [thawline/dsh-memewiki](https://github.com/thawline/dsh-memewiki)，MIT）。
+
+那份仓库本身是 **DSH（Node 插件体系）的插件，装不进这个 Python bot**，能复用的是它的 SQLite 词库：
+
+```bash
+qqbot/.venv/Scripts/python.exe qqbot/tools/fetch_memes.py     # 默认走 jsdelivr
+```
+
+17MB，不进仓库（`.gitignore` 里）。表结构：`memes(title, slug, tags, usage, origin, other, summary, aliases)`，注入用的是 `usage`（**怎么接**），不是 `origin`（出处故事，太长）。
+
+关键是**闸门**，见下面。
+
+### 梗库为什么要设闸门
+
+6792 条标题里有 331 个两字词、还有些纯数字。朴素的「标题出现在消息里就注入」在 30 条真实群消息上试过：
+
+```
+命中的 3 条里，1 条是真梗（蚁人去哪了），1 条是两字词误撞（马头），
+1 条是「325」这种数字标题撞上的（梨诺325大学习）
+```
+
+所以 `meme_block()` 两道闸：
+
+1. **像在问梗**才查：命中 `MEME_ASK_RE`（是什么梗 / 什么意思 / 出自哪 / 谁的梗 / 什么来头…），或者整条消息就是个 ≤8 字的裸词（无标点）。
+2. **键的过滤**：纯数字、单字一律不进索引；反向匹配（「码头」→「去码头整点薯条」）只对 3~6 字、且含中文或字母的查询做。
+
+同一批 30 条消息，加闸后只放行 16 条、命中 1 条且是真空。没命中就不注入，命中只注一条，注入体 190 字左右，末尾还会提醒「照用法接，别把解释念出来」。
+
+配置：
+
+```json
+"meme": { "enable": true, "max_chars": 130 }
+```
+
+`enable=false` 就完全退回「只有手写词典」的行为。优先级是手写/自动收录 > 梗库，前者命中就不再查后者。
 
 **③ prompt 三条兜底**（比前两个更关键）：
 

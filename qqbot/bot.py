@@ -14,6 +14,7 @@ import os
 import random
 import re
 import socket
+import sqlite3
 import time
 import urllib.error
 import urllib.request
@@ -2217,6 +2218,101 @@ def slang_hits(*texts: str, limit: int = 5) -> str:
     return "\n".join(hits[:limit])
 
 
+# ---------- 梗百科（本地词库，数据来自 cnmeme.wiki）----------
+# 词库文件 qqbot/memes.db（6792 条，17MB，不入库），由 tools/fetch_memes.py 拉取。
+# 思路来自 thawline/dsh-memewiki：只在这句「像在问梗」时才查，查到只注一条。
+# 朴素地「见到标题就注」实测会误伤——30 条真实群消息里有 3 条命中，
+# 其中「325」是纯数字标题撞的，所以这里加了闸门和长度/数字过滤。
+MEME_PATH = BASE / "memes.db"
+MEME_ASK_RE = re.compile(
+    r"(是什么梗|什么梗|啥梗|什么意思|啥意思|出自哪|哪来的|怎么来的|谁的梗"
+    r"|什么来头|什么出处|这梗|这个梗|梗是啥|这也能|什么典故)")
+# 反问句尾，做反向匹配前先摘掉
+MEME_TAIL_RE = re.compile(
+    r"(是什么梗|什么梗|啥梗|是什么意思|什么意思|啥意思|出自哪|哪来的|怎么来的"
+    r"|是谁的梗|什么来头|什么出处|什么典故|啊|呀|呢|吗|[?？!！。\s])+$")
+
+_MEME_INDEX: list[tuple[str, str]] | None = None
+_meme_db: sqlite3.Connection | None = None
+
+
+def _meme_index() -> list[tuple[str, str]]:
+    """一次读进内存：[(匹配键, 正式标题)]，长的在前。文件不在就空表。"""
+    global _MEME_INDEX, _meme_db
+    if _MEME_INDEX is not None:
+        return _MEME_INDEX
+    _MEME_INDEX = []
+    if not MEME_PATH.is_file():
+        log.info("没有梗库文件 %s，梗百科不启用（tools/fetch_memes.py 可以拉一份）",
+                 MEME_PATH.name)
+        return _MEME_INDEX
+    try:
+        _meme_db = sqlite3.connect(f"file:{MEME_PATH}?mode=ro", uri=True)
+        for title, aliases in _meme_db.execute("SELECT title, aliases FROM memes"):
+            for k in [title or ""] + (aliases or "").split(","):
+                k = k.strip()
+                # 纯数字和单字会乱撞（「325」「急」都当过标题）
+                if len(k) >= 2 and not k.isdigit():
+                    _MEME_INDEX.append((k, title))
+        _MEME_INDEX.sort(key=lambda x: -len(x[0]))
+        log.info("梗库就绪：%d 个匹配键 / %d 条词条",
+                 len(_MEME_INDEX),
+                 _meme_db.execute("SELECT COUNT(*) FROM memes").fetchone()[0])
+    except sqlite3.Error as exc:
+        log.warning("读梗库失败：%s", exc)
+        _MEME_INDEX = []
+    return _MEME_INDEX
+
+
+def meme_block(text: str) -> str:
+    """像在问梗时，从本地词库取一条塞进上下文；不像就不查。"""
+    c = cfg().get("meme") or {}
+    if not c.get("enable", True):
+        return ""
+    t = (text or "").strip()
+    if len(t) < 2 or "[图片]" in t or "[表情]" in t:
+        return ""
+    bare = len(t) <= 8 and not re.search(r"[，。！？,.!?\s]", t)
+    if not (MEME_ASK_RE.search(t) or bare):
+        return ""
+    idx = _meme_index()
+    if not idx:
+        return ""
+
+    title = ""
+    for k, name in idx:          # 已按长度倒序，第一个命中就是最具体的
+        if k in t:
+            title = name
+            break
+    if not title:
+        # 反向匹配：「码头」→「去码头整点薯条」。只对 3~6 字的短查询做，
+        # 太长了到处都能撞上；纯数字/纯符号不做——「325」会撞到「梨诺325大学习」。
+        q = MEME_TAIL_RE.sub("", t).strip()
+        if 3 <= len(q) <= 6 and re.search(r"[A-Za-z\u4e00-\u9fff]", q):
+            cands = [name for k, name in idx if q in k and len(name) <= 12]
+            if cands:
+                title = min(cands, key=len)
+    if not title:
+        return ""
+
+    try:
+        row = _meme_db.execute(
+            "SELECT usage, origin, tags FROM memes WHERE title=?", (title,)).fetchone()
+    except sqlite3.Error:
+        return ""
+    if not row:
+        return ""
+    usage, origin, tags = (row[0] or "", row[1] or "", row[2] or "")
+    body = " ".join((usage or origin).split())[: int(c.get("max_chars", 130))]
+    if not body:
+        return ""
+    head = f"【这个词本地梗库里有：{title}】"
+    if tags:
+        head += f"（{'、'.join(t for t in tags.split('、')[:3])}）"
+    return (head + "\n" + body +
+            "\n（照这个词的用法接，别把这段解释念出来；用户没问出处就别讲来历）")
+
+
 def _lore_entries(data: dict):
     """兼容两种写法：值是字符串（无别名），或 {aka, desc}。"""
     for name, val in data.items():
@@ -3104,6 +3200,12 @@ async def handle(ws, evt: dict) -> None:
     hits = slang_hits(text, bg)
     if hits:
         extra_parts.append(f"【群里的黑话】\n{hits}")
+    else:
+        # 手写/自动收录的都没命中，再看本地梗库（6792 条，只在像问梗时查）
+        meme = meme_block(text)
+        if meme:
+            extra_parts.append(meme)
+            log.info("梗库命中：%r", (text or "")[:24])
     # 本地词典都没命中、但句子明显在问具体事实时，硬性要求去查
     # 带图那次不给工具，塞这句只会让她说「我去查」然后查不了
     if (not lore and not hits and not images

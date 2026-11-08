@@ -24,6 +24,9 @@ __pycache__/
 *.egg-info/
 
 # ---------- 第三方与二进制 ----------
+# 梗库 17MB，用 tools/fetch_memes.py 拉，不进仓库
+qqbot/memes.db
+qqbot/memes.db.bak-*
 # napcat 是 112M 的第三方协议端，按 README 自己下载
 napcat/
 # snowluma 是试用中的另一个协议端（111M，含 node.exe），同样不入库
