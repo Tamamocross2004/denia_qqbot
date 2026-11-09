@@ -17,6 +17,8 @@ sys.path.insert(0, str(BASE))
 
 from openai import AsyncOpenAI  # noqa: E402
 
+import persona  # noqa: E402
+
 
 def load_env(path: Path) -> None:
     if not path.exists():
@@ -63,11 +65,14 @@ async def ask(system: str, user: str) -> str:
 
 
 async def main() -> None:
-    live = json.loads((BASE / "config.json").read_text(encoding="utf-8"))["system_prompt"]
+    cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+    spicy = (cfg.get("persona") or {}).get("spicy", 45)
+    live = persona.render(cfg["system_prompt"], spicy)
     cand_path = Path(sys.argv[1]) if len(sys.argv) > 1 else (
         BASE.parent / ".workbuddy" / "persona_new.txt")
-    cand = cand_path.read_text(encoding="utf-8").strip()
-    print(f"[*] 线上 {len(live)} 字  vs  候选 {cand_path}（{len(cand)} 字）")
+    cand = persona.render(cand_path.read_text(encoding="utf-8").strip(), spicy)
+    print(f"[*] 线上 {len(live)} 字（串子 {spicy}/100 {persona.tier_name(spicy)}）"
+          f"  vs  候选 {cand_path}（{len(cand)} 字）")
     for tag, q in CASES:
         a, b = await asyncio.gather(ask(live, q), ask(cand, q))
         print("=" * 70)

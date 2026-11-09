@@ -28,6 +28,7 @@ from openai import AsyncOpenAI
 
 import store
 import mailer
+import persona
 import video
 
 try:
@@ -508,6 +509,9 @@ async def ask(key: str, prompt: str, ctx: dict | None = None,
         log.debug("存对话历史失败：%s", exc)
 
     system = system or c.get("system_prompt", "")
+    # 串子层按档位渲染（config.persona.spicy → spicy.json）。解题那套 system
+    # 不带占位符，render() 原样返回。
+    system = persona.render(system, (c.get("persona") or {}).get("spicy", 45))
     if (c.get("schedule") or {}).get("enable", True):
         system = f"{system}\n\n{time_hint()}"
 
