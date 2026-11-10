@@ -2236,6 +2236,13 @@ MEME_TAIL_RE = re.compile(
     r"(是什么梗|什么梗|啥梗|是什么意思|什么意思|啥意思|出自哪|哪来的|怎么来的"
     r"|是谁的梗|什么来头|什么出处|什么典故|啊|呀|呢|吗|[?？!！。\s])+$")
 
+# 明确在问来历：这时候才把 origin（谁说的、哪来的）一起注入。
+# 不注入 origin 的后果实测过：问「哦对了是什么梗」，她只拿到用法，
+# 回一句「哦对了，你刚才那句我还没想好怎么回」——词库里明明写着张顺飞。
+MEME_ORIGIN_RE = re.compile(
+    r"(出自哪|哪来的|哪来的梗|谁的梗|谁说的|来历|出处|什么梗|啥梗|什么意思|啥意思)")
+MEME_ORIGIN_CHARS = 100
+
 _MEME_INDEX: list[tuple[str, str]] | None = None
 _meme_db: sqlite3.Connection | None = None
 
@@ -2313,8 +2320,16 @@ def meme_block(text: str) -> str:
     head = f"【这个词本地梗库里有：{title}】"
     if tags:
         head += f"（{'、'.join(t for t in tags.split('、')[:3])}）"
-    return (head + "\n" + body +
+    asked_origin = bool(MEME_ORIGIN_RE.search(t))
+    tail = ("\n（他在问来历，用你自己的话讲一两句，别整段念；讲完就收）"
+            if asked_origin else
             "\n（照这个词的用法接，别把这段解释念出来；用户没问出处就别讲来历）")
+    out = head + "\n" + body
+    if asked_origin:
+        origin = " ".join(origin.split())[:MEME_ORIGIN_CHARS]
+        if origin:
+            out += f"\n出处：{origin}"
+    return out + tail
 
 
 def _lore_entries(data: dict):
